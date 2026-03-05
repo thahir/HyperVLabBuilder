@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell.exe -Command \"Get-Command *-VM* -Module Hyper-V | Select-Object Name | Format-Table -AutoSize\")",
+      "Bash(powershell.exe -Command \"Get-ChildItem ''D:\\\\scripts\\\\HyperV'' -ErrorAction SilentlyContinue | Select-Object Name, Length | Format-Table -AutoSize\")",
+      "Bash(powershell.exe -NoProfile -Command \"Get-ChildItem -Path ''D:\\\\scripts\\\\HyperV'' | Select-Object Name\")",
+      "Bash(powershell.exe -NoProfile -Command \"Get-ChildItem -Path ''D:\\\\Scripts'' | Select-Object Name\")",
+      "Bash(powershell.exe -NoProfile -Command \"Get-VMSwitch -ErrorAction SilentlyContinue | Select-Object Name, SwitchType | Format-Table -AutoSize\")",
+      "WebFetch(domain:access.redhat.com)",
+      "WebFetch(domain:powershellisfun.com)",
+      "WebFetch(domain:docs.redhat.com)",
+      "WebFetch(domain:www.microsoft.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:www.unixsysadmin.com)",
+      "Bash(python3 -c \":*)",
+      "Bash(python -c \":*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:developers.redhat.com)"
+    ]
+  }
+}

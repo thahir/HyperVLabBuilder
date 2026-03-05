@@ -1,0 +1,504 @@
+function Invoke-SSHCommand {
+    <#
+    .SYNOPSIS
+        Executes a command on a Linux VM via SSH with retry logic.
+        Falls back to Hyper-V Copy-VMFile + guest trigger if SSH unavailable.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$VMName,
+        [Parameter(Mandatory)][string]$IP,
+        [Parameter(Mandatory)][string]$RootPassword,
+        [Parameter(Mandatory)][string]$ScriptContent,
+        [string]$ScriptName = "postinstall",
+        [string]$ServicePassword = "",
+        [int]$MaxRetries = 5,
+        [int]$RetryDelaySeconds = 30
+    )
+
+    $tempScript = "/tmp/boringlab-$ScriptName.sh"
+    $localTemp = Join-Path $env:TEMP "$VMName-$ScriptName.sh"
+    $scriptContent | Out-File -FilePath $localTemp -Encoding ASCII -Force -NoNewline
+
+    # Build the run command - pass service password as argument if provided
+    $svcPassArg = ""
+    if ($ServicePassword) { $svcPassArg = " '$ServicePassword'" }
+
+    $success = $false
+
+    # Method 1: Try SSH (available on Windows 10+)
+    for ($i = 1; $i -le $MaxRetries; $i++) {
+        Write-Host "[SSH ] Attempting SSH to $IP (try $i/$MaxRetries)..." -ForegroundColor Gray
+
+        # Remove stale host key
+        ssh-keygen -R $IP 2>&1 | Out-Null
+
+        # Try SCP + SSH using sshpass if available
+        $sshpassCmd = Get-Command "sshpass" -ErrorAction SilentlyContinue
+        if ($sshpassCmd) {
+            & sshpass -p $RootPassword scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 $localTemp "root@${IP}:$tempScript" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                & sshpass -p $RootPassword ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@$IP" "chmod +x $tempScript && nohup bash $tempScript$svcPassArg > /root/$ScriptName.log 2>&1 &"
+                $success = $true
+                break
+            }
+        }
+        else {
+            # Try with plink (PuTTY) if available
+            $plinkCmd = Get-Command "plink" -ErrorAction SilentlyContinue
+            if ($plinkCmd) {
+                $pscpCmd = Get-Command "pscp" -ErrorAction SilentlyContinue
+                if ($pscpCmd) {
+                    Write-Output "y" | & pscp -pw $RootPassword -batch $localTemp "root@${IP}:$tempScript" 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Output "y" | & plink -pw $RootPassword -batch "root@$IP" "chmod +x $tempScript && nohup bash $tempScript$svcPassArg > /root/$ScriptName.log 2>&1 &" 2>&1 | Out-Null
+                        $success = $true
+                        break
+                    }
+                }
+            }
+        }
+
+        if ($i -lt $MaxRetries) {
+            Write-Host "[SSH ] Connection failed. Retrying in ${RetryDelaySeconds}s..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
+
+    # Method 2: Fallback to Hyper-V Guest Services
+    if (-not $success) {
+        Write-Host "[INFO] SSH unavailable. Using Hyper-V Guest Services for '$VMName'..." -ForegroundColor Yellow
+        try {
+            Copy-VMFile -Name $VMName -SourcePath $localTemp -DestinationPath $tempScript `
+                -CreateFullPath -FileSource Host -Force -ErrorAction Stop
+
+            # Create a systemd oneshot service to execute the script
+            $serviceContent = @"
+[Unit]
+Description=BoringLab Post-Install ($ScriptName)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $tempScript
+StandardOutput=journal+console
+StandardError=journal+console
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"@
+            $serviceLocal = Join-Path $env:TEMP "$VMName-boringlab.service"
+            $serviceContent | Out-File -FilePath $serviceLocal -Encoding ASCII -Force -NoNewline
+            Copy-VMFile -Name $VMName -SourcePath $serviceLocal -DestinationPath "/etc/systemd/system/boringlab-postinstall.service" `
+                -CreateFullPath -FileSource Host -Force -ErrorAction SilentlyContinue
+
+            # Create a trigger to enable and start the service
+            $triggerContent = "#!/bin/bash`nchmod +x $tempScript`nsystemctl daemon-reload`nsystemctl start boringlab-postinstall.service"
+            $triggerLocal = Join-Path $env:TEMP "$VMName-trigger.sh"
+            $triggerContent | Out-File -FilePath $triggerLocal -Encoding ASCII -Force -NoNewline
+            Copy-VMFile -Name $VMName -SourcePath $triggerLocal -DestinationPath "/tmp/trigger-postinstall.sh" `
+                -CreateFullPath -FileSource Host -Force -ErrorAction SilentlyContinue
+
+            Remove-Item $serviceLocal, $triggerLocal -Force -ErrorAction SilentlyContinue
+            $success = $true
+            Write-Host "[OK  ] Script deployed via Guest Services to '$VMName'." -ForegroundColor Green
+            Write-Host "[INFO] NOTE: You may need to SSH in and run: bash /tmp/trigger-postinstall.sh" -ForegroundColor Yellow
+        }
+        catch {
+            Write-Warning "Guest Services copy also failed for '$VMName': $_"
+        }
+    }
+
+    Remove-Item $localTemp -Force -ErrorAction SilentlyContinue
+
+    if (-not $success) {
+        Write-Warning "Could not deploy post-install script to '$VMName'."
+        Write-Host "[INFO] Manual fallback: Copy and run the script on $VMName (${IP}):" -ForegroundColor Yellow
+        Write-Host "       scp post-scripts/$ScriptName.sh root@${IP}:/tmp/" -ForegroundColor Yellow
+        Write-Host "       ssh root@$IP 'bash /tmp/$ScriptName.sh'" -ForegroundColor Yellow
+    }
+
+    return $success
+}
+
+function Invoke-WindowsPostInstall {
+    <#
+    .SYNOPSIS
+        Runs post-install configuration on a Windows VM via PowerShell Direct.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$VMDef,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Config,
+
+        [Parameter(Mandatory)]
+        [PSCredential]$LocalCredential,
+
+        [PSCredential]$DomainCredential
+    )
+
+    $vmName = $VMDef.Name
+    $role   = $VMDef.Role
+    $scriptBase = Join-Path (Split-Path $PSScriptRoot -Parent) "post-scripts"
+
+    switch ($role) {
+        "DomainController" {
+            Write-Host "[POST] Configuring DC01 as Active Directory Domain Controller..." -ForegroundColor Cyan
+            $dcScript = Get-Content (Join-Path $scriptBase "Configure-DC.ps1") -Raw
+            $params = @{
+                DomainName    = $Config.DomainName
+                DomainNetBIOS = $Config.DomainNetBIOS
+                SafeModePass  = $LocalCredential.GetNetworkCredential().Password
+                DNSForwarders = $Config.DNSForwarders
+            }
+
+            Invoke-Command -VMName $vmName -Credential $LocalCredential -ScriptBlock {
+                param($script, $p)
+                $scriptBlock = [ScriptBlock]::Create($script)
+                & $scriptBlock @p
+            } -ArgumentList $dcScript, $params
+
+            # Wait for DC reboot after promotion (AD promotion forces reboot)
+            Write-Host "[WAIT] Waiting for DC01 to reboot after AD promotion..." -ForegroundColor Cyan
+            Start-Sleep -Seconds 60  # Give time for shutdown to initiate
+            Wait-LabVMReady -VMName $vmName -OS "Windows" -Credential $LocalCredential -TimeoutMinutes 15
+
+            # After promotion, try domain credential first, fall back to local
+            $dcCredential = $DomainCredential
+            $dcReady = $false
+            for ($retry = 1; $retry -le 10; $retry++) {
+                try {
+                    Invoke-Command -VMName $vmName -Credential $dcCredential -ScriptBlock {
+                        Get-ADDomain | Out-Null
+                    } -ErrorAction Stop
+                    $dcReady = $true
+                    break
+                }
+                catch {
+                    Write-Host "[WAIT] AD services not ready yet (attempt $retry/10)..." -ForegroundColor Gray
+                    Start-Sleep -Seconds 30
+                }
+            }
+
+            if (-not $dcReady) {
+                Write-Warning "AD services did not become ready on DC01. DHCP and DNS config may fail."
+            }
+
+            # Configure DNS forwarders
+            Write-Host "[POST] Configuring DNS forwarders on DC01..." -ForegroundColor Cyan
+            Invoke-Command -VMName $vmName -Credential $dcCredential -ScriptBlock {
+                param($forwarders)
+                Set-DnsServerForwarder -IPAddress $forwarders -ErrorAction SilentlyContinue
+            } -ArgumentList (,$Config.DNSForwarders)
+
+            # Configure DHCP after DC is back
+            Write-Host "[POST] Configuring DHCP on DC01..." -ForegroundColor Cyan
+            $dcIP = ($Config.VMs | Where-Object { $_.Role -eq "DomainController" } | Select-Object -First 1).IP
+            $dcFQDN = "DC01.$($Config.DomainName)"
+            $domainName = $Config.DomainName
+            $labName = $Config.LabName
+            $labGateway = $Config.Gateway
+
+            Invoke-Command -VMName $vmName -Credential $dcCredential -ScriptBlock {
+                param($dcFQDN, $dcIP, $domainName, $labName, $labGateway)
+                Install-WindowsFeature DHCP -IncludeManagementTools | Out-Null
+
+                Add-DhcpServerInDC -DnsName $dcFQDN -IPAddress $dcIP -ErrorAction SilentlyContinue
+
+                # Only create scope if it doesn't exist
+                $existing = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue | Where-Object { $_.ScopeId -eq "10.10.10.0" }
+                if (-not $existing) {
+                    Add-DhcpServerv4Scope -Name $labName `
+                        -StartRange 10.10.10.100 `
+                        -EndRange 10.10.10.200 `
+                        -SubnetMask 255.255.255.0 `
+                        -State Active
+
+                    Set-DhcpServerv4OptionValue -ScopeId 10.10.10.0 `
+                        -DnsDomain $domainName `
+                        -DnsServer $dcIP `
+                        -Router $labGateway
+                }
+
+                Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12" -Name "ConfigurationState" -Value 2 -ErrorAction SilentlyContinue
+            } -ArgumentList $dcFQDN, $dcIP, $domainName, $labName, $labGateway
+            Write-Host "[OK  ] DC01 fully configured (AD + DNS + DHCP)." -ForegroundColor Green
+        }
+
+        "MemberServer" {
+            Write-Host "[POST] Joining '$vmName' to domain and installing features..." -ForegroundColor Cyan
+            $joinScript = Get-Content (Join-Path $scriptBase "Join-Domain.ps1") -Raw
+
+            $dcIPAddr = ($Config.VMs | Where-Object { $_.Role -eq "DomainController" } | Select-Object -First 1).IP
+            Invoke-Command -VMName $vmName -Credential $LocalCredential -ScriptBlock {
+                param($script, $domain, $domainCred, $features, $dcip)
+                $scriptBlock = [ScriptBlock]::Create($script)
+                & $scriptBlock -DomainName $domain -Credential $domainCred -Features $features -DCIP $dcip
+            } -ArgumentList $joinScript, $Config.DomainName, $DomainCredential, $VMDef.Features, $dcIPAddr
+
+            # Wait for reboot after domain join
+            Start-Sleep -Seconds 30
+            Wait-LabVMReady -VMName $vmName -OS "Windows" -Credential $DomainCredential -TimeoutMinutes 15
+            Write-Host "[OK  ] '$vmName' joined to domain and configured." -ForegroundColor Green
+        }
+    }
+}
+
+function Invoke-LinuxPostInstall {
+    <#
+    .SYNOPSIS
+        Runs post-install configuration on a Linux VM via SSH with retry logic.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$VMDef,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Config,
+
+        [Parameter(Mandatory)]
+        [string]$RootPassword,
+
+        [string]$K8sJoinCommand
+    )
+
+    $vmName    = $VMDef.Name
+    $role      = $VMDef.Role
+    $ip        = $VMDef.IP
+    $svcPass   = if ($Config.ServicePassword) { $Config.ServicePassword } else { "BoringLab123!" }
+
+    Write-Host "[POST] Running post-install for '$vmName' (role: $role)..." -ForegroundColor Cyan
+
+    # Determine which script to run
+    $scriptFile = switch ($role) {
+        "Ansible"    { "setup-ansible.sh" }
+        "K8sMaster"  { "setup-k8s-master.sh" }
+        "K8sWorker"  { "setup-k8s-worker.sh" }
+        "GitLab"     { "setup-gitlab.sh" }
+        "Docker"     { "setup-docker-harbor.sh" }
+        "Monitoring" { "setup-monitoring.sh" }
+        "Database"   { "setup-database.sh" }
+        "Vault"      { "setup-vault.sh" }
+        "General"    { $null }
+        default      { $null }
+    }
+
+    if (-not $scriptFile) {
+        Write-Host "[SKIP] No post-install script for '$vmName' (role: $role)." -ForegroundColor Yellow
+        return
+    }
+
+    # Use $PSScriptRoot (modules/) to reliably find post-scripts/
+    $scriptBase = Join-Path (Split-Path $PSScriptRoot -Parent) "post-scripts"
+    $scriptPath = Join-Path $scriptBase $scriptFile
+    if (-not (Test-Path $scriptPath)) {
+        Write-Warning "Post-install script not found: $scriptPath"
+        return
+    }
+
+    $scriptContent = Get-Content $scriptPath -Raw
+
+    # For K8s workers, inject the join command
+    if ($role -eq "K8sWorker" -and $K8sJoinCommand) {
+        $scriptContent = $scriptContent -replace "##K8S_JOIN_COMMAND##", $K8sJoinCommand
+    }
+
+    # Scripts that accept service password as $1
+    $needsPassword = @("setup-database.sh", "setup-monitoring.sh", "setup-docker-harbor.sh", "setup-vault.sh")
+    if ($scriptFile -in $needsPassword) {
+        # Prepend the password argument to the script invocation
+        # The SSH command runs: bash script.sh "password"
+        $scriptContent = $scriptContent + "`n# Service password is passed as argument `$1"
+    }
+
+    Invoke-SSHCommand -VMName $vmName -IP $ip -RootPassword $RootPassword `
+        -ScriptContent $scriptContent -ScriptName $scriptFile.Replace(".sh", "") `
+        -ServicePassword $svcPass
+}
+
+function Invoke-AllPostInstall {
+    <#
+    .SYNOPSIS
+        Orchestrates post-install using wave-based parallel execution.
+        Dependency chain:
+          Wave 1: DC01 (must complete first)
+          Wave 2: WS01 + WS02 (parallel, need domain)
+                  + Ansible, K8s-Master, GitLab, Docker, Monitoring, DB (parallel, independent)
+          Wave 3: K8s Workers (parallel, need master join command)
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Config,
+
+        [Parameter(Mandatory)]
+        [PSCredential]$WinCredential,
+
+        [Parameter(Mandatory)]
+        [string]$RootPassword
+    )
+
+    $vms = $Config.VMs
+    $modulesPath = $PSScriptRoot
+
+    # Build domain credential
+    $domainUser = "$($Config.DomainNetBIOS)\$($Config.DomainAdminUser)"
+    $domainCred = New-Object PSCredential($domainUser, $WinCredential.Password)
+
+    # ============================================================
+    # Wave 1: Domain Controller (sequential - everything depends on it)
+    # ============================================================
+    Write-Host ""
+    Write-Host "=== Wave 1/3: Domain Controller ===" -ForegroundColor Magenta
+    $dc = $vms | Where-Object { $_.Role -eq "DomainController" }
+    if ($dc) {
+        Invoke-WindowsPostInstall -VMDef $dc -Config $Config -LocalCredential $WinCredential -DomainCredential $domainCred
+    }
+
+    # ============================================================
+    # Wave 2: Member Servers + ALL independent Linux VMs (PARALLEL)
+    # ============================================================
+    Write-Host ""
+    Write-Host "=== Wave 2/3: Member Servers + Linux Apps (parallel) ===" -ForegroundColor Magenta
+
+    $wave2Jobs = @()
+
+    # Member Servers (need domain from Wave 1)
+    $memberServers = $vms | Where-Object { $_.Role -eq "MemberServer" }
+    foreach ($ms in $memberServers) {
+        $wave2Jobs += Start-ThreadJob -Name "Post-$($ms.Name)" -ScriptBlock {
+            param($vmDef, $config, $localCred, $domCred, $modDir)
+            Import-Module (Join-Path $modDir "PostInstall.psm1") -Force
+            Import-Module (Join-Path $modDir "LabVM.psm1") -Force
+            Invoke-WindowsPostInstall -VMDef $vmDef -Config $config -LocalCredential $localCred -DomainCredential $domCred
+        } -ArgumentList $ms, $Config, $WinCredential, $domainCred, $modulesPath
+    }
+
+    # Independent Linux VMs (Ansible, K8s-Master, GitLab, Docker, Monitoring, Database)
+    $independentLinux = $vms | Where-Object { $_.Role -in @("Ansible", "K8sMaster", "GitLab", "Docker", "Monitoring", "Database", "Vault") }
+    foreach ($vm in $independentLinux) {
+        $wave2Jobs += Start-ThreadJob -Name "Post-$($vm.Name)" -ScriptBlock {
+            param($vmDef, $config, $rootPass, $modDir)
+            Import-Module (Join-Path $modDir "PostInstall.psm1") -Force
+            Invoke-LinuxPostInstall -VMDef $vmDef -Config $config -RootPassword $rootPass
+        } -ArgumentList $vm, $Config, $RootPassword, $modulesPath
+    }
+
+    if ($wave2Jobs.Count -gt 0) {
+        Write-Host "[PARA] Running $($wave2Jobs.Count) post-install jobs in parallel:" -ForegroundColor Cyan
+        foreach ($j in $wave2Jobs) {
+            Write-Host "       - $($j.Name)" -ForegroundColor Gray
+        }
+
+        # Wait for all Wave 2 jobs, print results as they complete
+        while ($wave2Jobs | Where-Object { $_.State -eq 'Running' }) {
+                Start-Sleep -Seconds 5
+        }
+
+        foreach ($j in $wave2Jobs) {
+            try {
+                Receive-Job $j -ErrorAction Stop | Out-Null
+                Write-Host "[OK  ] $($j.Name) completed." -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "$($j.Name) failed: $_"
+            }
+            Remove-Job $j -Force
+        }
+    }
+
+    # ============================================================
+    # Retrieve K8s join command from master
+    # ============================================================
+    $k8sMaster = $vms | Where-Object { $_.Role -eq "K8sMaster" }
+    $joinCommand = $null
+    if ($k8sMaster) {
+        Write-Host ""
+        Write-Host "[K8S ] Waiting for kubeadm init to complete on K8S-MASTER..." -ForegroundColor Cyan
+        $masterIP = $k8sMaster.IP
+        for ($attempt = 1; $attempt -le 20; $attempt++) {
+            Start-Sleep -Seconds 30
+            Write-Host "[K8S ] Checking for join command (attempt $attempt/20)..." -ForegroundColor Gray
+            try {
+                $joinCommand = & ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 `
+                    "root@$masterIP" "cat /root/k8s-join-command.txt 2>/dev/null || kubeadm token create --print-join-command 2>/dev/null" 2>$null
+
+                if ($joinCommand -and $joinCommand -match "kubeadm join") {
+                    Write-Host "[OK  ] K8s join command retrieved." -ForegroundColor Green
+                    break
+                }
+                $joinCommand = $null
+            }
+            catch { }
+        }
+
+        if (-not $joinCommand) {
+            Write-Warning "Could not retrieve K8s join command after 10 minutes. Workers will auto-retry from master."
+        }
+    }
+
+    # ============================================================
+    # Wave 3: K8s Workers (PARALLEL, need join command from master)
+    # ============================================================
+    $k8sWorkers = $vms | Where-Object { $_.Role -eq "K8sWorker" }
+    if ($k8sWorkers) {
+        Write-Host ""
+        Write-Host "=== Wave 3/3: Kubernetes Workers (parallel) ===" -ForegroundColor Magenta
+
+        $wave3Jobs = @()
+        foreach ($worker in $k8sWorkers) {
+            $wave3Jobs += Start-ThreadJob -Name "Post-$($worker.Name)" -ScriptBlock {
+                param($vmDef, $config, $rootPass, $joinCmd, $modDir)
+                Import-Module (Join-Path $modDir "PostInstall.psm1") -Force
+                Invoke-LinuxPostInstall -VMDef $vmDef -Config $config -RootPassword $rootPass -K8sJoinCommand $joinCmd
+            } -ArgumentList $worker, $Config, $RootPassword, $joinCommand, $modulesPath
+        }
+
+        Write-Host "[PARA] Running $($wave3Jobs.Count) K8s worker jobs in parallel." -ForegroundColor Cyan
+        $wave3Jobs | Wait-Job | ForEach-Object {
+            try {
+                Receive-Job $_ -ErrorAction Stop | Out-Null
+                Write-Host "[OK  ] $($_.Name) completed." -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "$($_.Name) failed: $_"
+            }
+            Remove-Job $_ -Force
+        }
+    }
+
+    # ============================================================
+    # Summary
+    # ============================================================
+    Write-Host ""
+    Write-Host "[OK  ] RHEL01 and RHEL02 are ready as general-purpose servers." -ForegroundColor Green
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host " BoringLab Post-Install Complete!" -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Lab Access Summary:" -ForegroundColor Cyan
+    foreach ($vm in $vms) {
+        $pad = ($vm.Name).PadRight(14)
+        Write-Host "  $pad : $($vm.IP)  ($($vm.Role))" -ForegroundColor White
+    }
+    Write-Host ""
+    $gitlabIP = ($vms | Where-Object { $_.Role -eq "GitLab" } | Select-Object -First 1).IP
+    $monitorIP = ($vms | Where-Object { $_.Role -eq "Monitoring" } | Select-Object -First 1).IP
+    $harborIP = ($vms | Where-Object { $_.Role -eq "Docker" } | Select-Object -First 1).IP
+    $vaultIP = ($vms | Where-Object { $_.Role -eq "Vault" } | Select-Object -First 1).IP
+    $svcPass = if ($Config.ServicePassword) { $Config.ServicePassword } else { "BoringLab123!" }
+
+    Write-Host "  Domain:  $($Config.DomainName)" -ForegroundColor White
+    Write-Host "  Windows: mstsc /v:<ip>  or  Invoke-Command -VMName <name>" -ForegroundColor White
+    Write-Host "  Linux:   ssh root@<ip>" -ForegroundColor White
+    if ($gitlabIP) { Write-Host "  GitLab:  http://$gitlabIP" -ForegroundColor White }
+    if ($monitorIP) { Write-Host "  Grafana: http://${monitorIP}:3000  (admin/$svcPass)" -ForegroundColor White }
+    if ($harborIP) { Write-Host "  Harbor:  http://$harborIP       (admin/$svcPass)" -ForegroundColor White }
+    if ($vaultIP) { Write-Host "  Vault:   http://${vaultIP}:8200   (keys in /root/vault-keys.txt)" -ForegroundColor White }
+}
+
+Export-ModuleMember -Function Invoke-WindowsPostInstall, Invoke-LinuxPostInstall, Invoke-AllPostInstall, Invoke-SSHCommand
