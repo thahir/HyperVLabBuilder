@@ -29,12 +29,23 @@ $ErrorActionPreference = "Continue"
 # ============================================================
 # Load Config
 # ============================================================
-$configPath = Join-Path $PSScriptRoot "config.psd1"
-if (-not (Test-Path $configPath)) {
-    Write-Host "ERROR: config.psd1 not found at $configPath" -ForegroundColor Red
+$modulePath = Join-Path $PSScriptRoot "modules"
+
+# Ensure powershell-yaml is available
+if (-not (Get-Module -ListAvailable -Name 'powershell-yaml')) {
+    Write-Host "ERROR: powershell-yaml module is required." -ForegroundColor Red
+    Write-Host "  Install: Install-Module -Name powershell-yaml -Scope CurrentUser -Force" -ForegroundColor Cyan
     exit 1
 }
-$Config = Import-PowerShellDataFile $configPath
+
+Import-Module (Join-Path $modulePath "ConfigLoader.psm1") -Force
+
+$configPath = Join-Path $PSScriptRoot "config.yaml"
+if (-not (Test-Path $configPath)) {
+    Write-Host "ERROR: config.yaml not found at $configPath" -ForegroundColor Red
+    exit 1
+}
+$Config = Import-LabConfig -Path $configPath
 
 # ============================================================
 # Collect Credentials
@@ -52,10 +63,13 @@ if (-not $SkipWindows) {
 }
 
 if (-not $SkipLinux) {
-    $rootSecure = Read-Host -Prompt "Linux root password" -AsSecureString
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($rootSecure)
-    $rootPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    $sshKeyPath = Join-Path $Config.VMPath ".ssh\boringlab_ed25519"
+    if (-not (Test-Path $sshKeyPath)) {
+        Write-Host "ERROR: SSH key not found at $sshKeyPath" -ForegroundColor Red
+        Write-Host "Run Build-BoringLab.ps1 first to generate the key pair." -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "Using SSH key: $sshKeyPath" -ForegroundColor Green
 }
 
 # ============================================================
@@ -105,7 +119,7 @@ function Invoke-SSHCheck {
         [int]$Timeout = 15
     )
     try {
-        $output = & ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$Timeout -o BatchMode=no "root@$IP" $Command 2>$null
+        $output = & ssh -i $sshKeyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$Timeout -o BatchMode=yes "root@$IP" $Command 2>$null
         return $output
     }
     catch { return $null }
@@ -322,7 +336,7 @@ if (-not $SkipLinux) {
     # Helper: test SSH reachability first
     function Test-SSHReachable {
         param([string]$IP)
-        $out = & ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=no "root@$IP" "echo OK" 2>$null
+        $out = & ssh -i $sshKeyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes "root@$IP" "echo OK" 2>$null
         return ($out -match "OK")
     }
 
@@ -555,8 +569,6 @@ if (-not $SkipLinux) {
                 $mysqlRunning = Invoke-SSHCheck -IP $ip -Command "systemctl is-active mysqld 2>/dev/null || systemctl is-active mariadb 2>/dev/null"
                 Test-Check -VM $vmName -Category "MySQL" -Check "MySQL/MariaDB running" -Passed ($mysqlRunning -match "active")
 
-                $mysqlDB = Invoke-SSHCheck -IP $ip -Command "mysql -u root -p`$SVC_PASSWORD -e 'SHOW DATABASES' 2>/dev/null | grep -q boringlab && echo YES || echo NO"
-                # Can't easily check MySQL without password in non-interactive SSH, so test port
                 $fw5432 = Invoke-SSHCheck -IP $ip -Command "firewall-cmd --list-ports 2>/dev/null | grep -q 5432 && echo YES || echo NO"
                 Test-Check -VM $vmName -Category "Database" -Check "Firewall port 5432 (PG) open" -Passed ($fw5432 -match "YES")
 
@@ -669,7 +681,4 @@ Write-Host "  Results exported to: $csvPath" -ForegroundColor Gray
 Write-Host ""
 
 # Cleanup
-if (-not $SkipLinux) {
-    $rootPassword = $null
-    [System.GC]::Collect()
-}
+[System.GC]::Collect()

@@ -1,17 +1,18 @@
 function Invoke-SSHCommand {
     <#
     .SYNOPSIS
-        Executes a command on a Linux VM via SSH with retry logic.
-        Falls back to Hyper-V Copy-VMFile + guest trigger if SSH unavailable.
+        Executes a script on a Linux VM via SSH key-based auth.
+        Uses the BoringLab SSH key injected via cloud-init.
+        Falls back to Hyper-V Guest Services if SSH unavailable.
     #>
     param(
         [Parameter(Mandatory)][string]$VMName,
         [Parameter(Mandatory)][string]$IP,
-        [Parameter(Mandatory)][string]$RootPassword,
+        [Parameter(Mandatory)][string]$SSHKeyPath,
         [Parameter(Mandatory)][string]$ScriptContent,
         [string]$ScriptName = "postinstall",
         [string]$ServicePassword = "",
-        [int]$MaxRetries = 5,
+        [int]$MaxRetries = 10,
         [int]$RetryDelaySeconds = 30
     )
 
@@ -23,38 +24,33 @@ function Invoke-SSHCommand {
     $svcPassArg = ""
     if ($ServicePassword) { $svcPassArg = " '$ServicePassword'" }
 
+    # Common SSH options
+    $sshOpts = @(
+        "-i", $SSHKeyPath,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "BatchMode=yes"
+    )
+
     $success = $false
 
-    # Method 1: Try SSH (available on Windows 10+)
+    # Method 1: SSH with key-based auth (Windows OpenSSH client)
     for ($i = 1; $i -le $MaxRetries; $i++) {
         Write-Host "[SSH ] Attempting SSH to $IP (try $i/$MaxRetries)..." -ForegroundColor Gray
 
         # Remove stale host key
         ssh-keygen -R $IP 2>&1 | Out-Null
 
-        # Try SCP + SSH using sshpass if available
-        $sshpassCmd = Get-Command "sshpass" -ErrorAction SilentlyContinue
-        if ($sshpassCmd) {
-            & sshpass -p $RootPassword scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 $localTemp "root@${IP}:$tempScript" 2>&1
+        # SCP the script to the VM
+        & scp @sshOpts $localTemp "root@${IP}:$tempScript" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            # Execute the script in background on the VM
+            & ssh @sshOpts "root@$IP" "chmod +x $tempScript && nohup bash $tempScript$svcPassArg > /root/$ScriptName.log 2>&1 &" 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) {
-                & sshpass -p $RootPassword ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "root@$IP" "chmod +x $tempScript && nohup bash $tempScript$svcPassArg > /root/$ScriptName.log 2>&1 &"
+                Write-Host "[OK  ] Script deployed and started on '$VMName' via SSH." -ForegroundColor Green
                 $success = $true
                 break
-            }
-        }
-        else {
-            # Try with plink (PuTTY) if available
-            $plinkCmd = Get-Command "plink" -ErrorAction SilentlyContinue
-            if ($plinkCmd) {
-                $pscpCmd = Get-Command "pscp" -ErrorAction SilentlyContinue
-                if ($pscpCmd) {
-                    Write-Output "y" | & pscp -pw $RootPassword -batch $localTemp "root@${IP}:$tempScript" 2>&1 | Out-Null
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Output "y" | & plink -pw $RootPassword -batch "root@$IP" "chmod +x $tempScript && nohup bash $tempScript$svcPassArg > /root/$ScriptName.log 2>&1 &" 2>&1 | Out-Null
-                        $success = $true
-                        break
-                    }
-                }
             }
         }
 
@@ -66,7 +62,7 @@ function Invoke-SSHCommand {
 
     # Method 2: Fallback to Hyper-V Guest Services
     if (-not $success) {
-        Write-Host "[INFO] SSH unavailable. Using Hyper-V Guest Services for '$VMName'..." -ForegroundColor Yellow
+        Write-Host "[INFO] SSH unavailable. Trying Hyper-V Guest Services for '$VMName'..." -ForegroundColor Yellow
         try {
             Copy-VMFile -Name $VMName -SourcePath $localTemp -DestinationPath $tempScript `
                 -CreateFullPath -FileSource Host -Force -ErrorAction Stop
@@ -93,7 +89,6 @@ WantedBy=multi-user.target
             Copy-VMFile -Name $VMName -SourcePath $serviceLocal -DestinationPath "/etc/systemd/system/boringlab-postinstall.service" `
                 -CreateFullPath -FileSource Host -Force -ErrorAction SilentlyContinue
 
-            # Create a trigger to enable and start the service
             $triggerContent = "#!/bin/bash`nchmod +x $tempScript`nsystemctl daemon-reload`nsystemctl start boringlab-postinstall.service"
             $triggerLocal = Join-Path $env:TEMP "$VMName-trigger.sh"
             $triggerContent | Out-File -FilePath $triggerLocal -Encoding ASCII -Force -NoNewline
@@ -115,8 +110,8 @@ WantedBy=multi-user.target
     if (-not $success) {
         Write-Warning "Could not deploy post-install script to '$VMName'."
         Write-Host "[INFO] Manual fallback: Copy and run the script on $VMName (${IP}):" -ForegroundColor Yellow
-        Write-Host "       scp post-scripts/$ScriptName.sh root@${IP}:/tmp/" -ForegroundColor Yellow
-        Write-Host "       ssh root@$IP 'bash /tmp/$ScriptName.sh'" -ForegroundColor Yellow
+        Write-Host "       scp -i <keypath> post-scripts/$ScriptName.sh root@${IP}:/tmp/" -ForegroundColor Yellow
+        Write-Host "       ssh -i <keypath> root@$IP 'bash /tmp/$ScriptName.sh'" -ForegroundColor Yellow
     }
 
     return $success
@@ -250,7 +245,7 @@ function Invoke-WindowsPostInstall {
 function Invoke-LinuxPostInstall {
     <#
     .SYNOPSIS
-        Runs post-install configuration on a Linux VM via SSH with retry logic.
+        Runs post-install configuration on a Linux VM via SSH key-based auth.
     #>
     param(
         [Parameter(Mandatory)]
@@ -260,7 +255,7 @@ function Invoke-LinuxPostInstall {
         [hashtable]$Config,
 
         [Parameter(Mandatory)]
-        [string]$RootPassword,
+        [string]$SSHKeyPath,
 
         [string]$K8sJoinCommand
     )
@@ -309,12 +304,10 @@ function Invoke-LinuxPostInstall {
     # Scripts that accept service password as $1
     $needsPassword = @("setup-database.sh", "setup-monitoring.sh", "setup-docker-harbor.sh", "setup-vault.sh")
     if ($scriptFile -in $needsPassword) {
-        # Prepend the password argument to the script invocation
-        # The SSH command runs: bash script.sh "password"
         $scriptContent = $scriptContent + "`n# Service password is passed as argument `$1"
     }
 
-    Invoke-SSHCommand -VMName $vmName -IP $ip -RootPassword $RootPassword `
+    Invoke-SSHCommand -VMName $vmName -IP $ip -SSHKeyPath $SSHKeyPath `
         -ScriptContent $scriptContent -ScriptName $scriptFile.Replace(".sh", "") `
         -ServicePassword $svcPass
 }
@@ -337,7 +330,7 @@ function Invoke-AllPostInstall {
         [PSCredential]$WinCredential,
 
         [Parameter(Mandatory)]
-        [string]$RootPassword
+        [string]$SSHKeyPath
     )
 
     $vms = $Config.VMs
@@ -380,10 +373,10 @@ function Invoke-AllPostInstall {
     $independentLinux = $vms | Where-Object { $_.Role -in @("Ansible", "K8sMaster", "GitLab", "Docker", "Monitoring", "Database", "Vault") }
     foreach ($vm in $independentLinux) {
         $wave2Jobs += Start-ThreadJob -Name "Post-$($vm.Name)" -ScriptBlock {
-            param($vmDef, $config, $rootPass, $modDir)
+            param($vmDef, $config, $keyPath, $modDir)
             Import-Module (Join-Path $modDir "PostInstall.psm1") -Force
-            Invoke-LinuxPostInstall -VMDef $vmDef -Config $config -RootPassword $rootPass
-        } -ArgumentList $vm, $Config, $RootPassword, $modulesPath
+            Invoke-LinuxPostInstall -VMDef $vmDef -Config $config -SSHKeyPath $keyPath
+        } -ArgumentList $vm, $Config, $SSHKeyPath, $modulesPath
     }
 
     if ($wave2Jobs.Count -gt 0) {
@@ -422,7 +415,7 @@ function Invoke-AllPostInstall {
             Start-Sleep -Seconds 30
             Write-Host "[K8S ] Checking for join command (attempt $attempt/20)..." -ForegroundColor Gray
             try {
-                $joinCommand = & ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 `
+                $joinCommand = & ssh -i $SSHKeyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes `
                     "root@$masterIP" "cat /root/k8s-join-command.txt 2>/dev/null || kubeadm token create --print-join-command 2>/dev/null" 2>$null
 
                 if ($joinCommand -and $joinCommand -match "kubeadm join") {
@@ -450,10 +443,10 @@ function Invoke-AllPostInstall {
         $wave3Jobs = @()
         foreach ($worker in $k8sWorkers) {
             $wave3Jobs += Start-ThreadJob -Name "Post-$($worker.Name)" -ScriptBlock {
-                param($vmDef, $config, $rootPass, $joinCmd, $modDir)
+                param($vmDef, $config, $keyPath, $joinCmd, $modDir)
                 Import-Module (Join-Path $modDir "PostInstall.psm1") -Force
-                Invoke-LinuxPostInstall -VMDef $vmDef -Config $config -RootPassword $rootPass -K8sJoinCommand $joinCmd
-            } -ArgumentList $worker, $Config, $RootPassword, $joinCommand, $modulesPath
+                Invoke-LinuxPostInstall -VMDef $vmDef -Config $config -SSHKeyPath $keyPath -K8sJoinCommand $joinCmd
+            } -ArgumentList $worker, $Config, $SSHKeyPath, $joinCommand, $modulesPath
         }
 
         Write-Host "[PARA] Running $($wave3Jobs.Count) K8s worker jobs in parallel." -ForegroundColor Cyan
@@ -501,4 +494,4 @@ function Invoke-AllPostInstall {
     if ($vaultIP) { Write-Host "  Vault:   http://${vaultIP}:8200   (keys in /root/vault-keys.txt)" -ForegroundColor White }
 }
 
-Export-ModuleMember -Function Invoke-WindowsPostInstall, Invoke-LinuxPostInstall, Invoke-AllPostInstall, Invoke-SSHCommand
+Export-ModuleMember -Function Invoke-WindowsPostInstall, Invoke-LinuxPostInstall, Invoke-AllPostInstall

@@ -29,7 +29,6 @@ function New-LabNetwork {
     $adapter = Get-NetAdapter | Where-Object { $_.Name -like "*$switchName*" }
     if (-not $adapter) {
         # Fallback: find adapter by interface description matching the switch
-        $vmNic = Get-VMSwitch -Name $switchName
         $adapter = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*Hyper-V Virtual Ethernet Adapter*" } |
             Where-Object {
                 $ifIndex = $_.ifIndex

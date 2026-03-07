@@ -95,7 +95,7 @@ Then add it to your PATH and re-run.
 RHEL cloud image not found in: $templatePath
 
 Auto-download may have failed. You can:
-  1. Re-run with AutoDownload = `$true in config.psd1
+  1. Re-run with AutoDownload = `$true in config.yaml
   2. Download manually from: https://access.redhat.com/downloads/content/rhel
      Place the .qcow2 file in: $templatePath
 "@
@@ -142,7 +142,7 @@ Auto-download may have failed. You can:
 Windows Server VHD not found in: $templatePath
 
 Auto-download may have failed. You can:
-  1. Re-run with AutoDownload = `$true in config.psd1
+  1. Re-run with AutoDownload = `$true in config.yaml
   2. Download manually from: https://www.microsoft.com/en-us/evalcenter/download-windows-server-2022
      Choose VHD format, place in: $templatePath
 "@

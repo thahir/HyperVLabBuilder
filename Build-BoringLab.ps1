@@ -12,7 +12,7 @@
     Uses PowerShell 7 parallel execution for fast VM creation, boot monitoring,
     and post-install configuration.
 
-    Set AutoDownload = $false in config.psd1 to disable auto-download.
+    Set AutoDownload = false in config.yaml to disable auto-download.
 
 .NOTES
     Run as Administrator on the Hyper-V host. Requires PowerShell 7+.
@@ -118,11 +118,31 @@ else {
     if ($convertVHDAvailable) { Write-Log "Convert-VHD (Hyper-V) is available." "Green" }
 }
 
-# Check for SSH client (needed for Linux post-install)
+# Check for SSH client (required for key-based Linux VM access)
 $sshAvailable = Get-Command "ssh.exe" -ErrorAction SilentlyContinue
 if (-not $sshAvailable) {
-    Write-Log "WARNING: OpenSSH client not found. Linux post-install will use Hyper-V Guest Services fallback." "Yellow"
+    Write-Log "ERROR: OpenSSH client not found. Required for Linux VM post-install." "Red"
     Write-Host "  Install: Settings > Apps > Optional Features > OpenSSH Client" -ForegroundColor Cyan
+    exit 1
+}
+Write-Log "OpenSSH client is available." "Green"
+
+# Check powershell-yaml module (needed for config.yaml)
+$yamlModule = Get-Module -ListAvailable -Name 'powershell-yaml'
+if (-not $yamlModule) {
+    Write-Log "powershell-yaml module not found. Installing..." "Yellow"
+    try {
+        Install-Module -Name powershell-yaml -Scope CurrentUser -Force -ErrorAction Stop
+        Write-Log "powershell-yaml module installed." "Green"
+    }
+    catch {
+        Write-Log "ERROR: Could not install powershell-yaml module." "Red"
+        Write-Host "  Install manually: Install-Module -Name powershell-yaml -Scope CurrentUser -Force" -ForegroundColor Cyan
+        exit 1
+    }
+}
+else {
+    Write-Log "powershell-yaml module is available." "Green"
 }
 
 Write-Log "Prerequisite checks complete." "Green"
@@ -133,15 +153,17 @@ Write-Host ""
 # ============================================================
 Write-Log "Phase 1: Loading configuration..." "Cyan"
 
-$configPath = Join-Path $PSScriptRoot "config.psd1"
+$modulePath = Join-Path $PSScriptRoot "modules"
+Import-Module (Join-Path $modulePath "ConfigLoader.psm1") -Force
+
+$configPath = Join-Path $PSScriptRoot "config.yaml"
 if (-not (Test-Path $configPath)) {
-    Write-Log "ERROR: config.psd1 not found at $configPath" "Red"
+    Write-Log "ERROR: config.yaml not found at $configPath" "Red"
     exit 1
 }
-$Config = Import-PowerShellDataFile $configPath
+$Config = Import-LabConfig -Path $configPath
 
 # Import modules
-$modulePath = Join-Path $PSScriptRoot "modules"
 Import-Module (Join-Path $modulePath "LabNetwork.psm1") -Force
 Import-Module (Join-Path $modulePath "LabVM.psm1") -Force
 Import-Module (Join-Path $modulePath "ImageDownload.psm1") -Force
@@ -189,6 +211,28 @@ $rhelPass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
 [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 
 Write-Log "Credentials collected (not logged)." "Green"
+
+# Generate SSH key pair for Linux VM access (key-based auth, no sshpass needed)
+$sshDir = Join-Path $Config.VMPath ".ssh"
+$sshKeyPath = Join-Path $sshDir "boringlab_ed25519"
+$sshPubKeyPath = "$sshKeyPath.pub"
+
+if (-not (Test-Path $sshKeyPath)) {
+    if (-not (Test-Path $sshDir)) {
+        New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+    }
+    Write-Log "Generating SSH key pair for lab access..." "Cyan"
+    & ssh-keygen -t ed25519 -f $sshKeyPath -N "" -C "boringlab-automation" 2>&1 | Out-Null
+    if (-not (Test-Path $sshPubKeyPath)) {
+        Write-Log "ERROR: SSH key generation failed. Ensure OpenSSH is installed." "Red"
+        exit 1
+    }
+    Write-Log "SSH key pair generated at $sshKeyPath" "Green"
+}
+else {
+    Write-Log "SSH key pair already exists at $sshKeyPath" "Green"
+}
+$sshPubKey = (Get-Content $sshPubKeyPath -Raw).Trim()
 
 # Download Windows VHD if missing, check RHEL image exists
 if ($Config.AutoDownload -ne $false) {
@@ -259,7 +303,8 @@ foreach ($vmDef in $linuxVMs) {
         New-Item -ItemType Directory -Path $vmFolder -Force | Out-Null
     }
     $ciISO = New-CloudInitISO -VMDef $vmDef -Config $Config `
-        -RootPassword $rootPassword -RHELUsername $rhelUser -RHELPassword $rhelPass
+        -RootPassword $rootPassword -RHELUsername $rhelUser -RHELPassword $rhelPass `
+        -SSHPublicKey $sshPubKey
     $linuxISOMap[$vmDef.Name] = $ciISO
 }
 
@@ -293,12 +338,13 @@ Write-Log "All VMs created." "Green"
 Write-Host ""
 Write-Log "Phase 4: Starting all VMs..." "Cyan"
 
-# Start DC01 first (needs head start for AD)
-Start-LabVM -VMName "DC01"
+# Start DC first (needs head start for AD)
+$dcVM = $Config.VMs | Where-Object { $_.Role -eq "DomainController" } | Select-Object -First 1
+Start-LabVM -VMName $dcVM.Name
 Start-Sleep -Seconds 3
 
 # Start all others in parallel
-$Config.VMs | Where-Object { $_.Name -ne "DC01" } | ForEach-Object -ThrottleLimit 12 -Parallel {
+$Config.VMs | Where-Object { $_.Role -ne "DomainController" } | ForEach-Object -ThrottleLimit 12 -Parallel {
     $vmName = $_.Name
     $vm = Get-VM -Name $vmName -ErrorAction SilentlyContinue
     if ($vm -and $vm.State -ne 'Running') {
@@ -314,13 +360,13 @@ Write-Log "All VMs started. Cloud-init / OOBE running..." "Green"
 Write-Host ""
 Write-Log "Phase 5: Waiting for VMs to boot (parallel monitoring)..." "Cyan"
 
-# Wait for DC01 first (everything depends on it)
-Wait-LabVMReady -VMName "DC01" -OS "Windows" -Credential $winCredential -TimeoutMinutes 15
+# Wait for DC first (everything depends on it)
+Wait-LabVMReady -VMName $dcVM.Name -OS "Windows" -Credential $winCredential -TimeoutMinutes 15
 
 # Wait for all other VMs in parallel using thread jobs
 $waitJobs = @()
 
-foreach ($vmDef in ($windowsVMs | Where-Object { $_.Name -ne "DC01" })) {
+foreach ($vmDef in ($windowsVMs | Where-Object { $_.Role -ne "DomainController" })) {
     $waitJobs += Start-ThreadJob -Name "Wait-$($vmDef.Name)" -ScriptBlock {
         param($vmName, $modPath, $cred)
         Import-Module (Join-Path $modPath "LabVM.psm1") -Force
@@ -332,7 +378,7 @@ foreach ($vmDef in $linuxVMs) {
     $waitJobs += Start-ThreadJob -Name "Wait-$($vmDef.Name)" -ScriptBlock {
         param($vmName, $modPath)
         Import-Module (Join-Path $modPath "LabVM.psm1") -Force
-        Wait-LabVMReady -VMName $vmName -OS "RHEL" -TimeoutMinutes 10
+        Wait-LabVMReady -VMName $vmName -OS "RHEL" -TimeoutMinutes 15
     } -ArgumentList $vmDef.Name, $modulePath
 }
 
@@ -352,7 +398,7 @@ Write-Log "All VMs are booted and responsive." "Green"
 if (-not $SkipPostInstall) {
     Write-Host ""
     Write-Log "Phase 6: Running post-install configuration (wave-based parallel)..." "Cyan"
-    Invoke-AllPostInstall -Config $Config -WinCredential $winCredential -RootPassword $rootPassword
+    Invoke-AllPostInstall -Config $Config -WinCredential $winCredential -SSHKeyPath $sshKeyPath
 }
 else {
     Write-Log "Phase 6: SKIPPED (-SkipPostInstall)" "Yellow"

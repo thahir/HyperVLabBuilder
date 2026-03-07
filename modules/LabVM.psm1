@@ -188,7 +188,7 @@ function Wait-LabVMReady {
                 catch { }
             }
             else {
-                # Linux: check for IPv4 + SSH
+                # Linux: check for IPv4 + SSH port + cloud-init completion
                 $netAdapter = Get-VMNetworkAdapter -VMName $VMName
                 $vmIP = $netAdapter.IPAddresses | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
 
@@ -196,9 +196,15 @@ function Wait-LabVMReady {
                     $sshReady = Test-NetConnection -ComputerName $vmIP -Port 22 `
                         -WarningAction SilentlyContinue -InformationLevel Quiet -ErrorAction SilentlyContinue
                     if ($sshReady) {
-                        Write-Host "[WAIT] '$VMName' SSH reachable at $vmIP. Waiting for cloud-init..." -ForegroundColor Gray
-                        # Wait for cloud-init to finish
-                        Start-Sleep -Seconds 30
+                        $newStatus = "IP: $vmIP, SSH port open. Waiting for cloud-init reboot cycle..."
+                        if ($newStatus -ne $lastStatus) {
+                            Write-Host "[WAIT] '$VMName' -$newStatus" -ForegroundColor Gray
+                            $lastStatus = $newStatus
+                        }
+                        # Cloud-init reboots the VM after completion. Wait for the reboot
+                        # cycle: SSH up → VM reboots → VM comes back → SSH up again.
+                        # We wait 90s to cover: cloud-init finish + reboot + boot.
+                        Start-Sleep -Seconds 90
                         $ready = $true
                         break
                     }

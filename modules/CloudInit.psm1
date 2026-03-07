@@ -19,7 +19,9 @@ function New-CloudInitISO {
         [string]$RHELUsername,
 
         [Parameter(Mandatory)]
-        [string]$RHELPassword
+        [string]$RHELPassword,
+
+        [string]$SSHPublicKey
     )
 
     $vmName   = $VMDef.Name
@@ -32,6 +34,7 @@ function New-CloudInitISO {
     $dns2     = $Config.DNSForwarders[0]
     $vmFolder = Join-Path $Config.VMPath $vmName
     $isK8s    = $VMDef.Role -like "K8s*"
+    $sshKeyLine = if ($SSHPublicKey) { "      - $SSHPublicKey" } else { "" }
 
     if (-not (Test-Path $vmFolder)) {
         New-Item -ItemType Directory -Path $vmFolder -Force | Out-Null
@@ -103,12 +106,15 @@ users:
   - name: root
     lock_passwd: false
     plain_text_passwd: '$yamlPassword'
-    ssh_authorized_keys: []
+    ssh_authorized_keys:
+$sshKeyLine
   - name: labadmin
     groups: wheel
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false
     plain_text_passwd: '$yamlPassword'
+    ssh_authorized_keys:
+$sshKeyLine
 
 ssh_pwauth: true
 disable_root: false
