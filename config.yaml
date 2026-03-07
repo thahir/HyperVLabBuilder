@@ -39,7 +39,7 @@ VMs:
     OS: Windows
     Role: DomainController
     RAM: 8GB
-    vCPU: 4
+    vCPU: 2
     Disks:
       - Size: 60
         Purpose: OS
@@ -48,8 +48,8 @@ VMs:
   - Name: WS01
     OS: Windows
     Role: MemberServer
-    RAM: 8GB
-    vCPU: 4
+    RAM: 4GB
+    vCPU: 2
     Disks:
       - Size: 60
         Purpose: OS
@@ -62,8 +62,8 @@ VMs:
   - Name: WS02
     OS: Windows
     Role: MemberServer
-    RAM: 8GB
-    vCPU: 4
+    RAM: 4GB
+    vCPU: 2
     Disks:
       - Size: 60
         Purpose: OS
@@ -116,7 +116,7 @@ VMs:
   - Name: RHEL01
     OS: RHEL
     Role: General
-    RAM: 8GB
+    RAM: 4GB
     vCPU: 4
     Disks:
       - Size: 50
@@ -126,7 +126,7 @@ VMs:
   - Name: RHEL02
     OS: RHEL
     Role: General
-    RAM: 8GB
+    RAM: 4GB
     vCPU: 4
     Disks:
       - Size: 50
@@ -180,7 +180,7 @@ VMs:
   - Name: VAULT01
     OS: RHEL
     Role: Vault
-    RAM: 4GB
+    RAM: 8GB
     vCPU: 2
     Disks:
       - Size: 40
