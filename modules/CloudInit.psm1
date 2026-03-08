@@ -29,12 +29,15 @@ function New-CloudInitISO {
     $gateway  = $Config.Gateway
     $prefix   = $Config.PrefixLength
     $domain   = $Config.DomainName
-    $dns1     = ($Config.VMs | Where-Object { $_.Role -eq "DomainController" } | Select-Object -First 1).IP
-    if (-not $dns1) { $dns1 = $gateway }
-    $dns2     = $Config.DNSForwarders[0]
+    # During first boot, DC01 DNS isn't running yet. Use external DNS as primary
+    # so cloud-init can reach Red Hat for subscription registration.
+    # DC01 IP is added as secondary for later domain resolution.
+    $dcIP     = ($Config.VMs | Where-Object { $_.Role -eq "DomainController" } | Select-Object -First 1).IP
+    $dns1     = $Config.DNSForwarders[0]  # External DNS (e.g., 8.8.8.8) — works during first boot
+    $dns2     = if ($dcIP) { $dcIP } else { $gateway }  # DC DNS — works after AD promotion
     $vmFolder = Join-Path $Config.VMPath $vmName
     $isK8s    = $VMDef.Role -like "K8s*"
-    $sshKeyLine = if ($SSHPublicKey) { "      - $SSHPublicKey" } else { "" }
+    $sshKeyBlock = if ($SSHPublicKey) { "`n    ssh_authorized_keys:`n      - $SSHPublicKey" } else { "" }
 
     if (-not (Test-Path $vmFolder)) {
         New-Item -ItemType Directory -Path $vmFolder -Force | Out-Null
@@ -55,12 +58,16 @@ local-hostname: $vmName
     $networkConfig = @"
 version: 2
 ethernets:
-  eth0:
+  hyperv0:
+    match:
+      driver: hv_netvsc
     dhcp4: false
     dhcp6: false
     addresses:
       - $ip/$prefix
-    gateway4: $gateway
+    routes:
+      - to: 0.0.0.0/0
+        via: $gateway
     nameservers:
       addresses:
         - $dns1
@@ -105,21 +112,41 @@ manage_etc_hosts: false
 users:
   - name: root
     lock_passwd: false
-    plain_text_passwd: '$yamlPassword'
-    ssh_authorized_keys:
-$sshKeyLine
+    plain_text_passwd: '$yamlPassword'$sshKeyBlock
   - name: labadmin
     groups: wheel
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false
-    plain_text_passwd: '$yamlPassword'
-    ssh_authorized_keys:
-$sshKeyLine
+    plain_text_passwd: '$yamlPassword'$sshKeyBlock
 
 ssh_pwauth: true
 disable_root: false
 
+# bootcmd runs BEFORE packages — register subscription so repos are available
+bootcmd:
+  - subscription-manager register --username="$RHELUsername" --password="$RHELPassword" --auto-attach > /root/rhel-registration.log 2>&1 || true
+  - subscription-manager repos --enable=rhel-10-for-x86_64-baseos-rpms --enable=rhel-10-for-x86_64-appstream-rpms 2>>/root/rhel-registration.log || true
+
 write_files:
+  - path: /etc/NetworkManager/system-connections/static-eth0.nmconnection
+    permissions: '0600'
+    content: |
+      [connection]
+      id=static-eth0
+      type=ethernet
+      autoconnect=true
+      autoconnect-priority=10
+
+      [ipv4]
+      method=manual
+      addresses=$ip/$prefix
+      gateway=$gateway
+      dns=$dns1;$dns2
+      dns-search=$domain
+
+      [ipv6]
+      method=disabled
+
   - path: /etc/hosts
     append: true
     content: |
@@ -160,12 +187,13 @@ packages:
   - hyperv-daemons
 
 runcmd:
+  # Apply static IP — bypass cloud-init network-config (RHEL skips it on boot-legacy)
+  - nmcli con load /etc/NetworkManager/system-connections/static-eth0.nmconnection
+  - nmcli con up static-eth0 2>/dev/null || true
+  - nmcli con delete "Wired connection 1" 2>/dev/null || true
+
   # Enable Hyper-V services
   - systemctl enable --now hypervkvpd hypervvssd hypervfcopyd 2>/dev/null || true
-
-  # Register with Red Hat
-  - subscription-manager register --username="$RHELUsername" --password="$RHELPassword" --auto-attach > /root/rhel-registration.log 2>&1 || true
-  - subscription-manager repos --enable=rhel-10-for-x86_64-baseos-rpms --enable=rhel-10-for-x86_64-appstream-rpms || true
 
   # Install node_exporter for monitoring
   - curl -fsSLo /tmp/node_exporter.tar.gz "https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz" || true

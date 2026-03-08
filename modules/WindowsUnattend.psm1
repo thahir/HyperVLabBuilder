@@ -23,7 +23,10 @@ function Inject-WindowsUnattend {
     $ip      = $VMDef.IP
     $gateway = $Config.Gateway
     $prefix  = $Config.PrefixLength
-    $dns     = $Config.Gateway
+    # DC01 uses gateway as DNS (it becomes its own DNS after promotion).
+    # Member servers point to DC01 so they can find the domain for domain-join.
+    $dcIP    = ($Config.VMs | Where-Object { $_.Role -eq "DomainController" } | Select-Object -First 1).IP
+    $dns     = if ($VMDef.Role -eq "DomainController") { $Config.Gateway } else { $dcIP }
 
     # Convert secure string for XML
     $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($AdminPassword)

@@ -132,7 +132,9 @@ function Wait-LabVMReady {
 
         [int]$TimeoutMinutes = 15,  # Much shorter for cloud images
 
-        [PSCredential]$Credential
+        [PSCredential]$Credential,
+
+        [string]$IP  # Known static IP — used when Hyper-V KVP hasn't reported yet
     )
 
     Write-Host "[WAIT] Waiting for '$VMName' to become ready (timeout: ${TimeoutMinutes}m)..." -ForegroundColor Cyan
@@ -192,21 +194,53 @@ function Wait-LabVMReady {
                 $netAdapter = Get-VMNetworkAdapter -VMName $VMName
                 $vmIP = $netAdapter.IPAddresses | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
 
+                # Fallback: use known static IP when KVP daemon hasn't reported yet
+                if (-not $vmIP -and $IP) { $vmIP = $IP }
+
                 if ($vmIP) {
                     $sshReady = Test-NetConnection -ComputerName $vmIP -Port 22 `
                         -WarningAction SilentlyContinue -InformationLevel Quiet -ErrorAction SilentlyContinue
                     if ($sshReady) {
-                        $newStatus = "IP: $vmIP, SSH port open. Waiting for cloud-init reboot cycle..."
+                        $newStatus = "IP: $vmIP, SSH open. Waiting for cloud-init reboot cycle..."
                         if ($newStatus -ne $lastStatus) {
                             Write-Host "[WAIT] '$VMName' -$newStatus" -ForegroundColor Gray
                             $lastStatus = $newStatus
                         }
-                        # Cloud-init reboots the VM after completion. Wait for the reboot
-                        # cycle: SSH up → VM reboots → VM comes back → SSH up again.
-                        # We wait 90s to cover: cloud-init finish + reboot + boot.
-                        Start-Sleep -Seconds 90
-                        $ready = $true
-                        break
+
+                        # Cloud-init reboots the VM after completion.
+                        # Strategy: wait for VM to go Off (reboot), then come back with SSH.
+                        $rebootDeadline = (Get-Date).AddMinutes(5)
+                        $sawReboot = $false
+                        while ((Get-Date) -lt $rebootDeadline -and (Get-Date) -lt $deadline) {
+                            Start-Sleep -Seconds 10
+                            $vmState = (Get-VM -Name $VMName -ErrorAction SilentlyContinue).State
+
+                            if ($vmState -eq 'Off') {
+                                $sawReboot = $true
+                                Write-Host "[WAIT] '$VMName' -Cloud-init reboot detected. Restarting..." -ForegroundColor Yellow
+                                Start-VM -Name $VMName -ErrorAction SilentlyContinue
+                                Start-Sleep -Seconds 15
+                            }
+
+                            if ($sawReboot -or ((Get-Date) -gt $rebootDeadline.AddMinutes(-3))) {
+                                # After reboot (or timeout waiting for reboot), verify SSH is back
+                                $sshBack = Test-NetConnection -ComputerName $vmIP -Port 22 `
+                                    -WarningAction SilentlyContinue -InformationLevel Quiet -ErrorAction SilentlyContinue
+                                if ($sshBack) {
+                                    $ready = $true
+                                    break
+                                }
+                            }
+                        }
+
+                        # If we never saw a reboot but SSH is still up, consider ready
+                        if (-not $ready) {
+                            $sshStillUp = Test-NetConnection -ComputerName $vmIP -Port 22 `
+                                -WarningAction SilentlyContinue -InformationLevel Quiet -ErrorAction SilentlyContinue
+                            if ($sshStillUp) { $ready = $true }
+                        }
+
+                        if ($ready) { break }
                     }
                     else {
                         $newStatus = "IP: $vmIP, SSH: waiting..."

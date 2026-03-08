@@ -8,12 +8,10 @@ VMPath: 'D:\HyperV\VMs'
 TemplatePath: 'D:\HyperV\Templates'
 
 # ===== Cloud Image Templates =====
-# The script auto-downloads these if missing from TemplatePath.
-# RHEL: Authenticated via your Red Hat subscription credentials.
-# Windows: Free evaluation VHD from Microsoft (180-day trial).
+# Place these files in TemplatePath before running.
+# RHEL: Download from https://access.redhat.com/downloads/content/rhel (KVM Guest Image .qcow2)
+# Windows: Download from https://www.microsoft.com/en-us/evalcenter/download-windows-server-2022 (VHD format)
 RHELCloudImage: rhel-10.1-x86_64-kvm.qcow2
-WindowsVHD: WindowsServer2022-eval.vhd
-AutoDownload: true
 
 # ===== Network =====
 SwitchName: BoringLabSwitch

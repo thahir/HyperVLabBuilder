@@ -12,8 +12,6 @@
     Uses PowerShell 7 parallel execution for fast VM creation, boot monitoring,
     and post-install configuration.
 
-    Set AutoDownload = false in config.yaml to disable auto-download.
-
 .NOTES
     Run as Administrator on the Hyper-V host. Requires PowerShell 7+.
 #>
@@ -166,7 +164,6 @@ $Config = Import-LabConfig -Path $configPath
 # Import modules
 Import-Module (Join-Path $modulePath "LabNetwork.psm1") -Force
 Import-Module (Join-Path $modulePath "LabVM.psm1") -Force
-Import-Module (Join-Path $modulePath "ImageDownload.psm1") -Force
 Import-Module (Join-Path $modulePath "CloudImage.psm1") -Force
 Import-Module (Join-Path $modulePath "CloudInit.psm1") -Force
 Import-Module (Join-Path $modulePath "WindowsUnattend.psm1") -Force
@@ -234,12 +231,6 @@ else {
 }
 $sshPubKey = (Get-Content $sshPubKeyPath -Raw).Trim()
 
-# Download Windows VHD if missing, check RHEL image exists
-if ($Config.AutoDownload -ne $false) {
-    Write-Log "Checking cloud image availability..." "Cyan"
-    Invoke-LabImageDownload -Config $Config
-}
-
 # Prepare templates (validate cloud images exist, convert if needed)
 Write-Log "Preparing cloud image templates..." "Cyan"
 try {
@@ -276,26 +267,7 @@ Write-Log "Phase 3: Creating VMs from cloud images (parallel)..." "Cyan"
 $windowsVMs = $Config.VMs | Where-Object { $_.OS -eq "Windows" }
 $linuxVMs   = $Config.VMs | Where-Object { $_.OS -eq "RHEL" }
 
-# --- Windows VMs: sequential (Mount-VHD for unattend injection needs exclusive access) ---
-foreach ($vmDef in $windowsVMs) {
-    $vmFolder = Join-Path $Config.VMPath $vmDef.Name
-    $vhdxPath = Join-Path $vmFolder "$($vmDef.Name).vhdx"
-
-    if (-not (Test-Path $vmFolder)) {
-        New-Item -ItemType Directory -Path $vmFolder -Force | Out-Null
-    }
-
-    Copy-TemplateVHDX -TemplatePath $templates.WindowsTemplate `
-                      -DestinationPath $vhdxPath `
-                      -SizeBytes ([int64]$vmDef.DiskGB * 1GB)
-
-    Inject-WindowsUnattend -VMDef $vmDef -Config $Config `
-                           -AdminPassword $winPassword -VHDXPath $vhdxPath
-
-    New-LabVM -VMDef $vmDef -Config $Config -TemplateVHDX $vhdxPath
-}
-
-# --- Linux VMs: create cloud-init ISOs sequentially (COM objects are not thread-safe) ---
+# --- Step 1: Create cloud-init ISOs sequentially (COM objects are not thread-safe) ---
 $linuxISOMap = @{}
 foreach ($vmDef in $linuxVMs) {
     $vmFolder = Join-Path $Config.VMPath $vmDef.Name
@@ -308,26 +280,42 @@ foreach ($vmDef in $linuxVMs) {
     $linuxISOMap[$vmDef.Name] = $ciISO
 }
 
-# --- Linux VMs: clone VHDX + create VM (PARALLEL) ---
-$linuxVMs | ForEach-Object -ThrottleLimit 5 -Parallel {
+# --- Step 2: Clone VHDX + inject config + create ALL VMs (PARALLEL) ---
+# Windows and Linux VMs in a single parallel batch. Each VM operates on its
+# own VHDX copy — no shared resource contention (Mount-VHD is per-disk).
+$Config.VMs | ForEach-Object -ThrottleLimit 5 -Parallel {
     $vmDef    = $_
     $config   = $using:Config
-    $rhelTpl  = $using:templates
+    $tpls     = $using:templates
     $isoMap   = $using:linuxISOMap
     $modPath  = $using:modulePath
+    $adminPwd = $using:winPassword
 
     Import-Module (Join-Path $modPath "CloudImage.psm1") -Force
     Import-Module (Join-Path $modPath "LabVM.psm1") -Force
+    Import-Module (Join-Path $modPath "WindowsUnattend.psm1") -Force
 
     $vmFolder = Join-Path $config.VMPath $vmDef.Name
     $vhdxPath = Join-Path $vmFolder "$($vmDef.Name).vhdx"
+    if (-not (Test-Path $vmFolder)) {
+        New-Item -ItemType Directory -Path $vmFolder -Force | Out-Null
+    }
 
-    Copy-TemplateVHDX -TemplatePath $rhelTpl.RHELTemplate `
-                      -DestinationPath $vhdxPath `
-                      -SizeBytes ([int64]$vmDef.DiskGB * 1GB)
-
-    $ciISO = $isoMap[$vmDef.Name]
-    New-LabVM -VMDef $vmDef -Config $config -TemplateVHDX $vhdxPath -CloudInitISO $ciISO
+    if ($vmDef.OS -eq "Windows") {
+        Copy-TemplateVHDX -TemplatePath $tpls.WindowsTemplate `
+                          -DestinationPath $vhdxPath `
+                          -SizeBytes ([int64]$vmDef.DiskGB * 1GB)
+        Inject-WindowsUnattend -VMDef $vmDef -Config $config `
+                               -AdminPassword $adminPwd -VHDXPath $vhdxPath
+        New-LabVM -VMDef $vmDef -Config $config -TemplateVHDX $vhdxPath
+    }
+    else {
+        Copy-TemplateVHDX -TemplatePath $tpls.RHELTemplate `
+                          -DestinationPath $vhdxPath `
+                          -SizeBytes ([int64]$vmDef.DiskGB * 1GB)
+        $ciISO = $isoMap[$vmDef.Name]
+        New-LabVM -VMDef $vmDef -Config $config -TemplateVHDX $vhdxPath -CloudInitISO $ciISO
+    }
 }
 
 Write-Log "All VMs created." "Green"
@@ -361,36 +349,61 @@ Write-Host ""
 Write-Log "Phase 5: Waiting for VMs to boot (parallel monitoring)..." "Cyan"
 
 # Wait for DC first (everything depends on it)
-Wait-LabVMReady -VMName $dcVM.Name -OS "Windows" -Credential $winCredential -TimeoutMinutes 15
+Wait-LabVMReady -VMName $dcVM.Name -OS "Windows" -Credential $winCredential -IP $dcVM.IP -TimeoutMinutes 15
 
-# Wait for all other VMs in parallel using thread jobs
-$waitJobs = @()
+# Wait for all other VMs in parallel using ForEach-Object -Parallel
+# (Start-ThreadJob runspaces cannot auto-load Hyper-V CDXML module; -Parallel can)
+$otherVMs = @($Config.VMs | Where-Object { $_.Role -ne "DomainController" })
+if ($otherVMs.Count -gt 0) {
+    Write-Log "Monitoring $($otherVMs.Count) VMs in parallel..." "Cyan"
+    $otherVMs | ForEach-Object -ThrottleLimit 13 -Parallel {
+        $vmDef   = $_
+        $modPath = $using:modulePath
+        $cred    = $using:winCredential
 
-foreach ($vmDef in ($windowsVMs | Where-Object { $_.Role -ne "DomainController" })) {
-    $waitJobs += Start-ThreadJob -Name "Wait-$($vmDef.Name)" -ScriptBlock {
-        param($vmName, $modPath, $cred)
         Import-Module (Join-Path $modPath "LabVM.psm1") -Force
-        Wait-LabVMReady -VMName $vmName -OS "Windows" -Credential $cred -TimeoutMinutes 15
-    } -ArgumentList $vmDef.Name, $modulePath, $winCredential
-}
 
-foreach ($vmDef in $linuxVMs) {
-    $waitJobs += Start-ThreadJob -Name "Wait-$($vmDef.Name)" -ScriptBlock {
-        param($vmName, $modPath)
-        Import-Module (Join-Path $modPath "LabVM.psm1") -Force
-        Wait-LabVMReady -VMName $vmName -OS "RHEL" -TimeoutMinutes 15
-    } -ArgumentList $vmDef.Name, $modulePath
-}
-
-if ($waitJobs.Count -gt 0) {
-    Write-Log "Monitoring $($waitJobs.Count) VMs in parallel..." "Cyan"
-    $waitJobs | Wait-Job | ForEach-Object {
-        Receive-Job $_ | Out-Null
-        Remove-Job $_
+        if ($vmDef.OS -eq "Windows") {
+            Wait-LabVMReady -VMName $vmDef.Name -OS "Windows" -Credential $cred -IP $vmDef.IP -TimeoutMinutes 15
+        }
+        else {
+            Wait-LabVMReady -VMName $vmDef.Name -OS "RHEL" -IP $vmDef.IP -TimeoutMinutes 15
+        }
     }
 }
 
-Write-Log "All VMs are booted and responsive." "Green"
+# Report actual VM states from Hyper-V
+$allVMNames = $Config.VMs | ForEach-Object { $_.Name }
+$runningVMs = Get-VM | Where-Object { $_.Name -in $allVMNames -and $_.State -eq 'Running' }
+$notRunning = Get-VM | Where-Object { $_.Name -in $allVMNames -and $_.State -ne 'Running' }
+if ($notRunning) {
+    Write-Log "$($runningVMs.Count)/$($allVMNames.Count) VMs running. Not running: $($notRunning.Name -join ', ')" "Yellow"
+}
+else {
+    Write-Log "All $($allVMNames.Count) VMs are running." "Green"
+}
+
+# --- Safety: restart any VMs that went Off during cloud-init reboot ---
+$stoppedVMs = Get-VM | Where-Object { $_.Name -in $allVMNames -and $_.State -eq 'Off' }
+if ($stoppedVMs) {
+    Write-Log "Restarting $($stoppedVMs.Count) VM(s) that rebooted during cloud-init..." "Yellow"
+    foreach ($stopped in $stoppedVMs) {
+        Write-Host "[VM  ] Restarting '$($stopped.Name)'..." -ForegroundColor Yellow
+        Start-VM -Name $stopped.Name -ErrorAction SilentlyContinue
+    }
+    # Wait for them to come back up
+    Start-Sleep -Seconds 60
+    # Verify all are running now
+    $stillStopped = Get-VM | Where-Object { $_.Name -in $allVMNames -and $_.State -eq 'Off' }
+    if ($stillStopped) {
+        foreach ($s in $stillStopped) {
+            Write-Warning "VM '$($s.Name)' is still off after restart attempt."
+        }
+    }
+    else {
+        Write-Log "All VMs are now running." "Green"
+    }
+}
 
 # ============================================================
 # Phase 6: Post-Install Configuration (WAVE-BASED PARALLEL)
@@ -424,7 +437,7 @@ $gitlabIP = ($Config.VMs | Where-Object { $_.Role -eq "GitLab" } | Select-Object
 $grafanaIP = ($Config.VMs | Where-Object { $_.Role -eq "Monitoring" } | Select-Object -First 1).IP
 $harborIP = ($Config.VMs | Where-Object { $_.Role -eq "Docker" } | Select-Object -First 1).IP
 $vaultIP = ($Config.VMs | Where-Object { $_.Role -eq "Vault" } | Select-Object -First 1).IP
-$svcPass = if ($Config.ServicePassword) { $Config.ServicePassword } else { "BoringLab123!" }
+$svcPass = $Config.ServicePassword
 
 Write-Host " Quick Access:" -ForegroundColor Cyan
 Write-Host "   Windows VMs:  mstsc /v:$dcIP  (DC01)" -ForegroundColor White

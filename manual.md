@@ -11,7 +11,7 @@ That's it. The script handles everything - downloading images, creating VMs, con
 
 ## What It Builds
 
-13 VMs on a `10.10.10.0/24` internal network with NAT (internet access):
+14 VMs on a `10.10.10.0/24` internal network with NAT (internet access):
 
 | VM | IP | OS | Purpose |
 |---|---|---|---|
@@ -28,6 +28,7 @@ That's it. The script handles everything - downloading images, creating VMs, con
 | DOCKER01 | 10.10.10.51 | RHEL 10 | Docker + Harbor registry |
 | MONITOR01 | 10.10.10.52 | RHEL 10 | Prometheus + Grafana + Alertmanager |
 | DB01 | 10.10.10.53 | RHEL 10 | PostgreSQL 17 + MySQL 8.4 |
+| VAULT01 | 10.10.10.54 | RHEL 10 | HashiCorp Vault |
 
 **Domain:** BoringLab.local
 **Total RAM:** ~120 GB across all VMs
@@ -46,18 +47,13 @@ That's it. The script handles everything - downloading images, creating VMs, con
    - Admin/root password (used for both Windows Administrator and Linux root)
    - Red Hat subscription username + password (popup dialog)
 
-2. **Image download** (first run only, ~6.5 GB total) — The script asks before downloading:
-   - RHEL 10 KVM cloud image (~1.5 GB) from Red Hat API
-   - Windows Server 2022 eval VHD (~5 GB) from Microsoft
-   - If qemu-img is needed and missing, offers to install via winget
+2. **Template preparation** — Validates and converts cloud images to VHDX format (place images in TemplatePath beforehand)
 
-3. **Template preparation** — Converts images to VHDX format
+3. **VM creation** — Clones template VHDXs, injects configuration (cloud-init for Linux, unattend.xml for Windows)
 
-4. **VM creation** — Clones template VHDXs, injects configuration (cloud-init for Linux, unattend.xml for Windows)
+4. **Boot** — Cloud images boot in 2-3 minutes (vs 25-30 min with ISOs)
 
-5. **Boot** — Cloud images boot in 2-3 minutes (vs 25-30 min with ISOs)
-
-6. **Post-install** — Fully automated:
+5. **Post-install** — Fully automated:
    - DC01: AD forest promotion, DNS, DHCP
    - WS01/WS02: Domain join, feature installation
    - ANSIBLE01: Ansible + collections + full lab inventory
@@ -66,8 +62,9 @@ That's it. The script handles everything - downloading images, creating VMs, con
    - DOCKER01: Docker + Harbor registry
    - MONITOR01: Prometheus/Grafana/Alertmanager stack
    - DB01: PostgreSQL 17 + MySQL 8.4 with sample databases
+   - VAULT01: HashiCorp Vault
 
-**Total time: ~20 minutes** (mostly post-install configuration)
+**Total time: ~80 minutes** (mostly post-install configuration)
 
 ## Accessing the Lab
 
@@ -115,16 +112,16 @@ ansible-inventory --list
 
 ## Configuration
 
-All settings are in `config.psd1`:
+All settings are in `config.yaml`:
 
 | Setting | Default | Description |
 |---|---|---|
 | `VMPath` | `D:\HyperV\VMs` | Where VM disks and configs are stored |
 | `TemplatePath` | `D:\HyperV\Templates` | Where cloud image templates are cached |
-| `AutoDownload` | `$true` | Auto-download images if missing |
 | `DomainName` | `BoringLab.local` | AD domain name |
 | `SwitchName` | `BoringLabSwitch` | Hyper-V virtual switch name |
 | `Subnet` | `10.10.10.0/24` | Lab network subnet |
+| `ServicePassword` | `BoringLab123!` | Password for Grafana, Harbor, DB, Vault |
 
 You can adjust VM RAM, vCPU, disk size, and IP addresses in the `VMs` array.
 
@@ -132,10 +129,10 @@ You can adjust VM RAM, vCPU, disk size, and IP addresses in the `VMs` array.
 
 The script is **idempotent** — safe to run again:
 - Existing VMs are skipped (not recreated or destroyed)
-- Existing templates are reused (not re-downloaded)
+- Existing templates are reused
 - Existing network/switch is reused
 
-To add a VM: add its definition to `config.psd1` and re-run.
+To add a VM: add its definition to `config.yaml` and re-run.
 
 ## Skipping Post-Install
 
@@ -144,24 +141,13 @@ To create VMs without configuring them:
 .\Build-BoringLab.ps1 -SkipPostInstall
 ```
 
-## Disabling Auto-Download
+## Cloud Image Setup
 
-If you prefer to download images manually:
-1. Set `AutoDownload = $false` in `config.psd1`
-2. Place images in `D:\HyperV\Templates\`:
-   - RHEL: Download KVM Guest Image (.qcow2) from https://access.redhat.com/downloads/content/rhel
-   - Windows: Download VHD from https://www.microsoft.com/en-us/evalcenter/download-windows-server-2022
-3. Install qemu-img if using .qcow2: `winget install SoftwareFreedomConservancy.QEMU`
+Place these files in `D:\HyperV\Templates\` before running:
 
-## Red Hat Auth Troubleshooting
-
-The script tries your subscription credentials first. If that fails (e.g., 2FA enabled), it will ask for an **offline token**:
-
-1. Go to https://access.redhat.com/management/api
-2. Click "Generate Token"
-3. Paste the token when prompted
-
-This is a one-time step per session (the token is not saved anywhere).
+1. **RHEL 10 KVM Guest Image** (.qcow2) — Download from https://access.redhat.com/downloads/content/rhel
+2. **Windows Server 2022 Evaluation VHD** (.vhd) — Download from https://www.microsoft.com/en-us/evalcenter/download-windows-server-2022
+3. **qemu-img** (for .qcow2 conversion) — `winget install SoftwareFreedomConservancy.QEMU`
 
 ## Log Files
 
@@ -174,15 +160,16 @@ Credentials are **never** written to log files.
 ```
 HyperVLsbBuilder/
 ├── Build-BoringLab.ps1           # Main entry point
-├── config.psd1                    # All configuration
+├── Audit-BoringLab.ps1           # Post-build verification
+├── config.yaml                    # All configuration
 ├── manual.md                      # This file
 ├── modules/
-│   ├── ImageDownload.psm1        # Auto-download cloud images
+│   ├── ConfigLoader.psm1         # YAML config parser
 │   ├── CloudImage.psm1           # Template validation + conversion
 │   ├── CloudInit.psm1            # Linux VM cloud-init config
 │   ├── WindowsUnattend.psm1      # Windows VM unattend injection
 │   ├── LabNetwork.psm1           # Virtual switch + NAT
-│   ├── LabVM.psm1                # VM creation
+│   ├── LabVM.psm1                # VM creation + boot monitoring
 │   └── PostInstall.psm1          # Post-boot configuration
 └── post-scripts/
     ├── Configure-DC.ps1          # AD DS promotion
@@ -193,5 +180,6 @@ HyperVLsbBuilder/
     ├── setup-gitlab.sh           # GitLab CE
     ├── setup-docker-harbor.sh    # Docker + Harbor
     ├── setup-monitoring.sh       # Prometheus + Grafana
-    └── setup-database.sh         # PostgreSQL + MySQL
+    ├── setup-database.sh         # PostgreSQL + MySQL
+    └── setup-vault.sh            # HashiCorp Vault
 ```

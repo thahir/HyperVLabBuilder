@@ -94,40 +94,25 @@ Then add it to your PATH and re-run.
             throw @"
 RHEL cloud image not found in: $templatePath
 
-Auto-download may have failed. You can:
-  1. Re-run with AutoDownload = `$true in config.yaml
-  2. Download manually from: https://access.redhat.com/downloads/content/rhel
-     Place the .qcow2 file in: $templatePath
+Download manually from: https://access.redhat.com/downloads/content/rhel
+Place the .qcow2 file in: $templatePath
 "@
         }
     }
 
     # === Windows Server VHD ===
-    $winSource = Join-Path $templatePath $Config.WindowsVHD
     $winTemplate = Join-Path $templatePath "winserver2022-template.vhdx"
 
     if (Test-Path $winTemplate) {
         Write-Host "[SKIP] Windows template VHDX already exists: $winTemplate" -ForegroundColor Yellow
     }
-    elseif (Test-Path $winSource) {
-        $ext = [System.IO.Path]::GetExtension($winSource).ToLower()
-        if ($ext -eq ".vhd") {
-            Write-Host "[IMG ] Converting Windows VHD to VHDX..." -ForegroundColor Cyan
-            Convert-VHDtoVHDX -SourcePath $winSource -DestinationPath $winTemplate
-        }
-        else {
-            Write-Host "[IMG ] Copying Windows VHDX template..." -ForegroundColor Cyan
-            Copy-Item $winSource $winTemplate
-        }
-        Write-Host "[OK  ] Windows template ready: $winTemplate" -ForegroundColor Green
-    }
     else {
-        # Check if Windows VHD exists with a different name/extension
+        # Search for any Windows VHD/VHDX in the template directory
         $anyWin = Get-ChildItem $templatePath -Filter "Windows*" -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in @(".vhd", ".vhdx") } | Select-Object -First 1
         if ($anyWin) {
             $winSource = $anyWin.FullName
-            Write-Host "[IMG ] Found Windows image with different name: $($anyWin.Name)" -ForegroundColor Cyan
+            Write-Host "[IMG ] Found Windows image: $($anyWin.Name)" -ForegroundColor Cyan
             if ($anyWin.Extension -eq ".vhd") {
                 Write-Host "[IMG ] Converting Windows VHD to VHDX..." -ForegroundColor Cyan
                 Convert-VHDtoVHDX -SourcePath $winSource -DestinationPath $winTemplate
@@ -141,10 +126,8 @@ Auto-download may have failed. You can:
             throw @"
 Windows Server VHD not found in: $templatePath
 
-Auto-download may have failed. You can:
-  1. Re-run with AutoDownload = `$true in config.yaml
-  2. Download manually from: https://www.microsoft.com/en-us/evalcenter/download-windows-server-2022
-     Choose VHD format, place in: $templatePath
+Download manually from: https://www.microsoft.com/en-us/evalcenter/download-windows-server-2022
+Choose VHD format, place in: $templatePath
 "@
         }
     }
