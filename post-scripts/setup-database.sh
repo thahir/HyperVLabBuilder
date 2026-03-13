@@ -141,12 +141,13 @@ WHERE NOT EXISTS (SELECT 1 FROM lab_info LIMIT 1);
 FLUSH PRIVILEGES;
 MYSQL_SETUP
 
-# Open firewall ports
-firewall-cmd --permanent --add-port=5432/tcp  # PostgreSQL
-firewall-cmd --permanent --add-port=3306/tcp  # MySQL
-firewall-cmd --permanent --add-port=9187/tcp  # PostgreSQL exporter
-firewall-cmd --permanent --add-port=9104/tcp  # MySQL exporter
-firewall-cmd --reload
+# Open firewall ports (at end so core setup isn't blocked)
+systemctl enable --now firewalld 2>/dev/null || true
+firewall-cmd --permanent --add-port=5432/tcp  2>/dev/null || true  # PostgreSQL
+firewall-cmd --permanent --add-port=3306/tcp  2>/dev/null || true  # MySQL
+firewall-cmd --permanent --add-port=9187/tcp  2>/dev/null || true  # PostgreSQL exporter
+firewall-cmd --permanent --add-port=9104/tcp  2>/dev/null || true  # MySQL exporter
+firewall-cmd --reload 2>/dev/null || true
 
 echo ""
 echo "=== Database setup complete ==="

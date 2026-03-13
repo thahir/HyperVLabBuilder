@@ -123,9 +123,10 @@ ssh_pwauth: true
 disable_root: false
 
 # bootcmd runs BEFORE packages — register subscription so repos are available
+# timeout prevents hang if network/RHSM servers are unreachable
 bootcmd:
-  - subscription-manager register --username="$RHELUsername" --password="$RHELPassword" --auto-attach > /root/rhel-registration.log 2>&1 || true
-  - subscription-manager repos --enable=rhel-10-for-x86_64-baseos-rpms --enable=rhel-10-for-x86_64-appstream-rpms 2>>/root/rhel-registration.log || true
+  - timeout 120 subscription-manager register --username="$RHELUsername" --password="$RHELPassword" > /root/rhel-registration.log 2>&1 || true
+  - timeout 60 subscription-manager repos --enable=rhel-10-for-x86_64-baseos-rpms --enable=rhel-10-for-x86_64-appstream-rpms 2>>/root/rhel-registration.log || true
 
 write_files:
   - path: /etc/NetworkManager/system-connections/static-eth0.nmconnection
@@ -151,6 +152,14 @@ write_files:
     append: true
     content: |
 $hostsBlock
+
+  - path: /etc/dnf/dnf.conf
+    append: true
+    content: |
+      # Prevent dnf from hanging on unreachable repos
+      timeout=60
+      retries=2
+      skip_if_unavailable=True
 
   - path: /etc/ssh/sshd_config.d/99-boringlab.conf
     content: |

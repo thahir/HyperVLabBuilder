@@ -21,11 +21,6 @@ if ! command -v vault &>/dev/null; then
     dnf install -y vault
 fi
 
-# Open firewall ports
-firewall-cmd --permanent --add-port=8200/tcp  # Vault API
-firewall-cmd --permanent --add-port=8201/tcp  # Vault cluster
-firewall-cmd --reload
-
 # Create Vault data directory
 mkdir -p /opt/vault/data
 
@@ -207,3 +202,9 @@ echo "Quick commands:"
 echo "  export VAULT_ADDR=http://10.10.10.54:8200"
 echo "  vault login -method=userpass username=labadmin"
 echo "  vault kv get secret/boringlab/service-password"
+
+# Open firewall ports (at end so core setup isn't blocked)
+systemctl enable --now firewalld 2>/dev/null || true
+firewall-cmd --permanent --add-port=8200/tcp  2>/dev/null || true  # Vault API
+firewall-cmd --permanent --add-port=8201/tcp  2>/dev/null || true  # Vault cluster
+firewall-cmd --reload 2>/dev/null || true

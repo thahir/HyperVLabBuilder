@@ -61,16 +61,6 @@ EOF
 dnf install -y kubelet kubeadm kubectl
 systemctl enable kubelet
 
-# Open firewall ports for master
-firewall-cmd --permanent --add-port=6443/tcp      # API server
-firewall-cmd --permanent --add-port=2379-2380/tcp  # etcd
-firewall-cmd --permanent --add-port=10250/tcp      # kubelet
-firewall-cmd --permanent --add-port=10259/tcp      # kube-scheduler
-firewall-cmd --permanent --add-port=10257/tcp      # kube-controller-manager
-firewall-cmd --permanent --add-port=179/tcp        # Calico BGP
-firewall-cmd --permanent --add-port=4789/udp       # VXLAN
-firewall-cmd --reload
-
 # Initialize Kubernetes cluster
 echo "Initializing Kubernetes cluster..."
 if ! kubeadm init \
@@ -110,6 +100,17 @@ kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/late
 # Patch for self-signed certs in lab
 kubectl patch deployment metrics-server -n kube-system --type='json' \
     -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]' || true
+
+# Open firewall ports (at end so core setup isn't blocked by firewalld issues)
+systemctl enable --now firewalld 2>/dev/null || true
+firewall-cmd --permanent --add-port=6443/tcp      2>/dev/null || true  # API server
+firewall-cmd --permanent --add-port=2379-2380/tcp  2>/dev/null || true  # etcd
+firewall-cmd --permanent --add-port=10250/tcp      2>/dev/null || true  # kubelet
+firewall-cmd --permanent --add-port=10259/tcp      2>/dev/null || true  # kube-scheduler
+firewall-cmd --permanent --add-port=10257/tcp      2>/dev/null || true  # kube-controller-manager
+firewall-cmd --permanent --add-port=179/tcp        2>/dev/null || true  # Calico BGP
+firewall-cmd --permanent --add-port=4789/udp       2>/dev/null || true  # VXLAN
+firewall-cmd --reload 2>/dev/null || true
 
 echo "=== Kubernetes Master setup complete ==="
 echo "Join command saved to /root/k8s-join-command.txt"

@@ -8,12 +8,6 @@ echo "=== BoringLab: GitLab CE Setup ==="
 dnf install -y curl policycoreutils openssh-server perl postfix
 systemctl enable --now sshd postfix
 
-# Open firewall ports
-firewall-cmd --permanent --add-service=http
-firewall-cmd --permanent --add-service=https
-firewall-cmd --permanent --add-port=8080/tcp
-firewall-cmd --reload
-
 # Add GitLab CE repository
 curl -fsSL https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.rpm.sh | bash
 
@@ -71,3 +65,10 @@ else
     echo "You can reset the root password with:"
     echo "  gitlab-rake 'gitlab:password:reset[root]'"
 fi
+
+# Open firewall ports (at end so core setup isn't blocked)
+systemctl enable --now firewalld 2>/dev/null || true
+firewall-cmd --permanent --add-service=http   2>/dev/null || true
+firewall-cmd --permanent --add-service=https  2>/dev/null || true
+firewall-cmd --permanent --add-port=8080/tcp  2>/dev/null || true
+firewall-cmd --reload 2>/dev/null || true

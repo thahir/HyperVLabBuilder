@@ -9,15 +9,16 @@
     Creates a 14-VM DevOps lab on Hyper-V using cloud images (no ISOs needed).
     VMs boot in 2-3 minutes instead of 25-30 with traditional ISO installs.
 
-    Uses PowerShell 7 parallel execution for fast VM creation, boot monitoring,
-    and post-install configuration.
+    Uses PowerShell 7 parallel execution for fast VM creation and boot monitoring.
+    Post-install configuration is handled by Install-BoringLab.ps1 (called automatically).
 
 .NOTES
     Run as Administrator on the Hyper-V host. Requires PowerShell 7+.
 #>
 
 param(
-    [switch]$SkipPostInstall
+    [switch]$SkipPostInstall,
+    [switch]$Sequential
 )
 
 $ErrorActionPreference = "Continue"
@@ -167,8 +168,6 @@ Import-Module (Join-Path $modulePath "LabVM.psm1") -Force
 Import-Module (Join-Path $modulePath "CloudImage.psm1") -Force
 Import-Module (Join-Path $modulePath "CloudInit.psm1") -Force
 Import-Module (Join-Path $modulePath "WindowsUnattend.psm1") -Force
-Import-Module (Join-Path $modulePath "PostInstall.psm1") -Force
-
 # Validate config
 Write-Log "Validating configuration..." "Cyan"
 $allIPs = $Config.VMs | ForEach-Object { $_.IP }
@@ -208,6 +207,26 @@ $rhelPass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
 [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 
 Write-Log "Credentials collected (not logged)." "Green"
+
+# Validate Red Hat subscription credentials via RHSM API (basic auth)
+Write-Log "Validating Red Hat subscription credentials..." "Cyan"
+try {
+    $pair = "${rhelUser}:${rhelPass}"
+    $base64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pair))
+    $headers = @{ Authorization = "Basic $base64" }
+    $null = Invoke-RestMethod -Uri "https://subscription.rhsm.redhat.com/subscription/users/$rhelUser/owners" `
+        -Headers $headers -ErrorAction Stop
+    Write-Log "Red Hat credentials validated successfully." "Green"
+} catch {
+    $statusCode = $_.Exception.Response.StatusCode.value__
+    if ($statusCode -eq 401 -or $statusCode -eq 403) {
+        Write-Log "ERROR: Red Hat credentials are invalid. Please check your username/password." "Red"
+        exit 1
+    } else {
+        Write-Log "WARNING: Could not validate Red Hat credentials online (status: $statusCode). Proceeding anyway..." "Yellow"
+        Write-Log "  Detail: $($_.Exception.Message)" "Yellow"
+    }
+}
 
 # Generate SSH key pair for Linux VM access (key-based auth, no sshpass needed)
 $sshDir = Join-Path $Config.VMPath ".ssh"
@@ -406,15 +425,22 @@ if ($stoppedVMs) {
 }
 
 # ============================================================
-# Phase 6: Post-Install Configuration (WAVE-BASED PARALLEL)
+# Phase 6: Post-Install Configuration (via Install-BoringLab.ps1)
 # ============================================================
 if (-not $SkipPostInstall) {
     Write-Host ""
-    Write-Log "Phase 6: Running post-install configuration (wave-based parallel)..." "Cyan"
-    Invoke-AllPostInstall -Config $Config -WinCredential $winCredential -SSHKeyPath $sshKeyPath
+    Write-Log "Phase 6: Handing off to Install-BoringLab.ps1 for post-install..." "Cyan"
+    $installScript = Join-Path $PSScriptRoot "Install-BoringLab.ps1"
+    $installParams = @{
+        WinCredential = $winCredential
+        SSHKeyPath    = $sshKeyPath
+    }
+    if ($Sequential) { $installParams.Sequential = $true }
+    & $installScript @installParams
 }
 else {
     Write-Log "Phase 6: SKIPPED (-SkipPostInstall)" "Yellow"
+    Write-Log "Run .\Install-BoringLab.ps1 later to configure VMs." "Yellow"
 }
 
 # ============================================================

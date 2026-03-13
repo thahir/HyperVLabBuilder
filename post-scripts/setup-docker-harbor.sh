@@ -24,13 +24,6 @@ systemctl enable --now docker
 # Add labadmin to docker group
 usermod -aG docker labadmin
 
-# Open firewall ports
-firewall-cmd --permanent --add-service=http
-firewall-cmd --permanent --add-service=https
-firewall-cmd --permanent --add-port=4443/tcp  # Harbor admin
-firewall-cmd --permanent --add-port=5000/tcp  # Docker registry
-firewall-cmd --reload
-
 # Install Harbor
 HARBOR_VERSION="v2.10.0"
 echo "Downloading Harbor ${HARBOR_VERSION}..."
@@ -56,6 +49,13 @@ if ! ./install.sh --with-trivy; then
     echo "ERROR: Harbor installation failed."
     exit 1
 fi
+
+# Open firewall ports (at end so core setup isn't blocked)
+systemctl enable --now firewalld 2>/dev/null || true
+firewall-cmd --permanent --add-port=80/tcp    2>/dev/null || true  # Harbor HTTP
+firewall-cmd --permanent --add-port=443/tcp   2>/dev/null || true  # Harbor HTTPS
+firewall-cmd --permanent --add-port=4443/tcp  2>/dev/null || true  # Harbor Notary
+firewall-cmd --reload 2>/dev/null || true
 
 echo ""
 echo "=== Docker + Harbor setup complete ==="

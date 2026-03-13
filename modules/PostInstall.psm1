@@ -1,9 +1,12 @@
 function Invoke-SSHCommand {
     <#
     .SYNOPSIS
-        Executes a script on a Linux VM via SSH key-based auth.
-        Uses the BoringLab SSH key injected via cloud-init.
-        Falls back to Hyper-V Guest Services if SSH unavailable.
+        Executes a script on a Linux VM via SSH using nohup + poll pattern.
+        Script runs detached (survives SSH disconnect / Ctrl+C), and the build
+        polls for the exit-code file to appear. This prevents:
+          - Infinite hangs (Linux timeout kills the script)
+          - Killed scripts on SSH disconnect (nohup keeps it running)
+          - Orphaned PowerShell pipelines
     #>
     param(
         [Parameter(Mandatory)][string]$VMName,
@@ -13,11 +16,15 @@ function Invoke-SSHCommand {
         [string]$ScriptName = "postinstall",
         [string]$ServicePassword = "",
         [int]$MaxRetries = 20,
-        [int]$RetryDelaySeconds = 30
+        [int]$RetryDelaySeconds = 30,
+        [int]$ExecutionTimeoutMinutes = 120,
+        [int]$PollIntervalSeconds = 30
     )
 
     $tempScript = "/tmp/boringlab-$ScriptName.sh"
-    $localTemp = Join-Path $env:TEMP "$VMName-$ScriptName.sh"
+    $exitFile   = "/tmp/boringlab-$ScriptName.exit"
+    $pidFile    = "/tmp/boringlab-$ScriptName.pid"
+    $localTemp  = Join-Path $env:TEMP "$VMName-$ScriptName.sh"
     $scriptContent | Out-File -FilePath $localTemp -Encoding ASCII -Force -NoNewline
 
     # Build the run command - pass service password as argument if provided
@@ -25,58 +32,24 @@ function Invoke-SSHCommand {
     if ($ServicePassword) { $svcPassArg = " '$ServicePassword'" }
 
     # Common SSH options
-    # ServerAliveInterval/CountMax = kill session if server stops responding for 5 min (60s * 5)
     $sshOpts = @(
         "-i", $SSHKeyPath,
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=10",
-        "-o", "BatchMode=yes",
-        "-o", "ServerAliveInterval=60",
-        "-o", "ServerAliveCountMax=5"
+        "-o", "BatchMode=yes"
     )
 
-    $success = $false
+    $deployed = $false
 
-    # Method 1: SSH with key-based auth (Windows OpenSSH client)
+    # --- Phase 1: Deploy script via SCP ---
     for ($i = 1; $i -le $MaxRetries; $i++) {
         Write-Host "[SSH ] Attempting SSH to $IP (try $i/$MaxRetries)..." -ForegroundColor Gray
-
-        # Remove stale host key
         ssh-keygen -R $IP 2>&1 | Out-Null
 
-        # SCP the script to the VM
         & scp @sshOpts $localTemp "root@${IP}:$tempScript" 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            # Check RHEL subscription now that SSH is confirmed working
-            $subStatus = & ssh @sshOpts "root@$IP" "subscription-manager status 2>&1 | head -1" 2>$null
-            if ($subStatus -match "Current|Valid") {
-                Write-Host "[OK  ] '$VMName' RHEL subscription active." -ForegroundColor Green
-            }
-            else {
-                Write-Warning "'$VMName' RHEL subscription not active. Post-install may fail for packages requiring RHEL repos."
-            }
-
-            # Execute the script synchronously and check exit code.
-            # Scripts use `exec > logfile 2>&1` so stdout goes to their own log.
-            # We capture exit code via a separate echo after the script completes.
-            Write-Host "[SSH ] Script deployed to '$VMName'. Executing (this may take several minutes)..." -ForegroundColor Cyan
-            & ssh @sshOpts "root@$IP" "chmod +x $tempScript && bash $tempScript$svcPassArg; echo BORINGLAB_EXIT=`$? > /tmp/boringlab-$ScriptName.exit" 2>&1 | Out-Null
-
-            # Check exit code
-            $exitResult = & ssh @sshOpts "root@$IP" "cat /tmp/boringlab-$ScriptName.exit 2>/dev/null" 2>&1
-            $scriptExitCode = if ($exitResult -match 'BORINGLAB_EXIT=(\d+)') { [int]$Matches[1] } else { -1 }
-
-            if ($scriptExitCode -eq 0) {
-                Write-Host "[OK  ] Post-install completed on '$VMName' (exit code 0)." -ForegroundColor Green
-            }
-            elseif ($scriptExitCode -gt 0) {
-                Write-Warning "Post-install on '$VMName' exited with code $scriptExitCode. Check logs on the VM."
-            }
-            else {
-                Write-Host "[OK  ] Script ran on '$VMName' (exit code unknown — check logs)." -ForegroundColor Yellow
-            }
-            $success = $true
+            $deployed = $true
             break
         }
 
@@ -86,45 +59,13 @@ function Invoke-SSHCommand {
         }
     }
 
-    # Method 2: Fallback to Hyper-V Guest Services
-    if (-not $success) {
+    # Fallback: Hyper-V Guest Services
+    if (-not $deployed) {
         Write-Host "[INFO] SSH unavailable. Trying Hyper-V Guest Services for '$VMName'..." -ForegroundColor Yellow
         try {
             Copy-VMFile -Name $VMName -SourcePath $localTemp -DestinationPath $tempScript `
                 -CreateFullPath -FileSource Host -Force -ErrorAction Stop
-
-            # Create a systemd oneshot service to execute the script
-            $serviceContent = @"
-[Unit]
-Description=BoringLab Post-Install ($ScriptName)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $tempScript
-StandardOutput=journal+console
-StandardError=journal+console
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-"@
-            $serviceLocal = Join-Path $env:TEMP "$VMName-boringlab.service"
-            $serviceContent | Out-File -FilePath $serviceLocal -Encoding ASCII -Force -NoNewline
-            Copy-VMFile -Name $VMName -SourcePath $serviceLocal -DestinationPath "/etc/systemd/system/boringlab-postinstall.service" `
-                -CreateFullPath -FileSource Host -Force -ErrorAction SilentlyContinue
-
-            $triggerContent = "#!/bin/bash`nchmod +x $tempScript`nsystemctl daemon-reload`nsystemctl start boringlab-postinstall.service"
-            $triggerLocal = Join-Path $env:TEMP "$VMName-trigger.sh"
-            $triggerContent | Out-File -FilePath $triggerLocal -Encoding ASCII -Force -NoNewline
-            Copy-VMFile -Name $VMName -SourcePath $triggerLocal -DestinationPath "/tmp/trigger-postinstall.sh" `
-                -CreateFullPath -FileSource Host -Force -ErrorAction SilentlyContinue
-
-            Remove-Item $serviceLocal, $triggerLocal -Force -ErrorAction SilentlyContinue
-            $success = $true
-            Write-Host "[OK  ] Script deployed via Guest Services to '$VMName'." -ForegroundColor Green
-            Write-Host "[INFO] NOTE: You may need to SSH in and run: bash /tmp/trigger-postinstall.sh" -ForegroundColor Yellow
+            $deployed = $true
         }
         catch {
             Write-Warning "Guest Services copy also failed for '$VMName': $_"
@@ -133,14 +74,70 @@ WantedBy=multi-user.target
 
     Remove-Item $localTemp -Force -ErrorAction SilentlyContinue
 
-    if (-not $success) {
+    if (-not $deployed) {
         Write-Warning "Could not deploy post-install script to '$VMName'."
-        Write-Host "[INFO] Manual fallback: Copy and run the script on $VMName (${IP}):" -ForegroundColor Yellow
-        Write-Host "       scp -i <keypath> post-scripts/$ScriptName.sh root@${IP}:/tmp/" -ForegroundColor Yellow
-        Write-Host "       ssh -i <keypath> root@$IP 'bash /tmp/$ScriptName.sh'" -ForegroundColor Yellow
+        Write-Host "[INFO] Manual fallback: scp post-scripts/$ScriptName.sh root@${IP}:/tmp/ && ssh root@$IP 'bash /tmp/$ScriptName.sh'" -ForegroundColor Yellow
+        return $false
     }
 
-    return $success
+    # Check RHEL subscription
+    $subStatus = & ssh @sshOpts "root@$IP" "subscription-manager status 2>&1" 2>$null
+    if ($subStatus -match "Overall Status:\s*(Current|Valid|Registered)") {
+        Write-Host "[OK  ] '$VMName' RHEL subscription active." -ForegroundColor Green
+    }
+    else {
+        Write-Warning "'$VMName' RHEL subscription not active. Post-install may fail for packages requiring RHEL repos."
+    }
+
+    # --- Phase 2: Launch script detached via nohup ---
+    # The wrapper: run the actual script with timeout, write exit code to file, record PID.
+    # nohup ensures the script survives SSH disconnect / Ctrl+C.
+    $timeoutSec = $ExecutionTimeoutMinutes * 60
+    $launchCmd = @(
+        "rm -f $exitFile $pidFile"
+        "chmod +x $tempScript"
+        "nohup bash -c 'timeout --signal=TERM --kill-after=30 $timeoutSec bash $tempScript$svcPassArg; echo BORINGLAB_EXIT=\`\$? > $exitFile' > /tmp/boringlab-$ScriptName-nohup.log 2>&1 &"
+        "echo `$! > $pidFile"
+    ) -join " && "
+
+    Write-Host "[SSH ] Script deployed to '$VMName'. Launching detached (timeout: ${ExecutionTimeoutMinutes}m)..." -ForegroundColor Cyan
+    & ssh @sshOpts "root@$IP" $launchCmd 2>&1 | Out-Null
+
+    # --- Phase 3: Poll for completion ---
+    $deadline = (Get-Date).AddMinutes($ExecutionTimeoutMinutes + 5)  # Extra 5 min grace
+    $lastProgress = ""
+
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $PollIntervalSeconds
+
+        # Check if exit file exists (script finished)
+        $exitResult = & ssh @sshOpts "root@$IP" "cat $exitFile 2>/dev/null" 2>$null
+        if ($exitResult -match 'BORINGLAB_EXIT=(\d+)') {
+            $scriptExitCode = [int]$Matches[1]
+
+            if ($scriptExitCode -eq 0) {
+                Write-Host "[OK  ] Post-install completed on '$VMName' (exit code 0)." -ForegroundColor Green
+            }
+            elseif ($scriptExitCode -eq 124) {
+                Write-Warning "Post-install on '$VMName' TIMED OUT after ${ExecutionTimeoutMinutes}m. Check /root/*-setup.log on the VM."
+            }
+            elseif ($scriptExitCode -gt 0) {
+                Write-Warning "Post-install on '$VMName' exited with code $scriptExitCode. Check logs on the VM."
+            }
+            return $true
+        }
+
+        # Script still running — show progress (last line of setup log)
+        $progress = & ssh @sshOpts "root@$IP" "tail -1 /root/*-setup.log 2>/dev/null | head -c 120" 2>$null
+        if ($progress -and $progress -ne $lastProgress) {
+            $elapsed = [math]::Round(((Get-Date) - $deadline.AddMinutes(-($ExecutionTimeoutMinutes + 5))).TotalMinutes)
+            Write-Host "[POLL] '$VMName' (${elapsed}m): $progress" -ForegroundColor Gray
+            $lastProgress = $progress
+        }
+    }
+
+    Write-Warning "Post-install on '$VMName' did not complete within $($ExecutionTimeoutMinutes + 5)m. Script may still be running on the VM."
+    return $false
 }
 
 function Invoke-WindowsPostInstall {

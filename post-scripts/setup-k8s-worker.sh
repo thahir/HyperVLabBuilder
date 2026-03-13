@@ -59,13 +59,6 @@ EOF
 dnf install -y kubelet kubeadm kubectl
 systemctl enable kubelet
 
-# Open firewall ports for worker
-firewall-cmd --permanent --add-port=10250/tcp      # kubelet
-firewall-cmd --permanent --add-port=30000-32767/tcp # NodePort range
-firewall-cmd --permanent --add-port=179/tcp         # Calico BGP
-firewall-cmd --permanent --add-port=4789/udp        # VXLAN
-firewall-cmd --reload
-
 # Join the cluster
 # This placeholder is replaced by PostInstall.psm1 with the actual join command
 JOIN_CMD="##K8S_JOIN_COMMAND##"
@@ -98,5 +91,13 @@ else
         echo "Then run the output on this worker."
     fi
 fi
+
+# Open firewall ports (at end so core setup isn't blocked)
+systemctl enable --now firewalld 2>/dev/null || true
+firewall-cmd --permanent --add-port=10250/tcp      2>/dev/null || true  # kubelet
+firewall-cmd --permanent --add-port=30000-32767/tcp 2>/dev/null || true # NodePort range
+firewall-cmd --permanent --add-port=179/tcp         2>/dev/null || true  # Calico BGP
+firewall-cmd --permanent --add-port=4789/udp        2>/dev/null || true  # VXLAN
+firewall-cmd --reload 2>/dev/null || true
 
 echo "=== Kubernetes Worker setup complete ==="

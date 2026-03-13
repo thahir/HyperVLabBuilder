@@ -120,6 +120,9 @@ function Invoke-SSHCheck {
     )
     try {
         $output = & ssh -i $sshKeyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$Timeout -o BatchMode=yes "root@$IP" $Command 2>$null
+        # Always return a single string — multi-line output causes -match to return
+        # arrays instead of booleans, crashing Test-Check's [bool] -Passed parameter.
+        if ($output -is [array]) { return ($output -join "`n") }
         return $output
     }
     catch { return $null }
@@ -379,7 +382,7 @@ if (-not $SkipLinux) {
         # RHEL subscription (optional check)
         $subStatus = Invoke-SSHCheck -IP $ip -Command "subscription-manager status 2>/dev/null | grep -i 'overall status' | awk -F: '{print `$2}' | xargs"
         if ($subStatus) {
-            Test-Check -VM $vmName -Category "RHEL" -Check "RHEL subscription active" -Passed ($subStatus -match "Current|Valid") -Detail "Status: $($subStatus.Trim())"
+            Test-Check -VM $vmName -Category "RHEL" -Check "RHEL subscription active" -Passed ([bool]($subStatus -match "Current|Valid|Registered")) -Detail "Status: $($subStatus.Trim())"
         }
 
         # --- Role-specific checks ---
@@ -584,7 +587,7 @@ if (-not $SkipLinux) {
                 Test-Check -VM $vmName -Category "Vault" -Check "Vault initialized" -Passed ($vaultInit -match "true")
 
                 $vaultSealed = Invoke-SSHCheck -IP $ip -Command "VAULT_ADDR=http://127.0.0.1:8200 vault status 2>/dev/null | grep -oP 'Sealed\s+\K\w+'"
-                Test-Check -VM $vmName -Category "Vault" -Check "Vault unsealed" -Passed ($vaultSealed -match "false") -Detail "Sealed: $($vaultSealed.Trim())"
+                Test-Check -VM $vmName -Category "Vault" -Check "Vault unsealed" -Passed ($vaultSealed -match "false") -Detail "Sealed: $(if ($vaultSealed) { $vaultSealed.Trim() } else { 'N/A' })"
 
                 $keysFile = Invoke-SSHCheck -IP $ip -Command "test -f /root/vault-keys.txt && echo YES || echo NO"
                 Test-Check -VM $vmName -Category "Vault" -Check "Unseal keys file exists (/root/vault-keys.txt)" -Passed ($keysFile -match "YES")
@@ -593,7 +596,7 @@ if (-not $SkipLinux) {
                 Test-Check -VM $vmName -Category "Vault" -Check "Init JSON exists (/root/vault-init.json)" -Passed ($initJson -match "YES")
 
                 $keysPerms = Invoke-SSHCheck -IP $ip -Command "stat -c '%a' /root/vault-keys.txt 2>/dev/null"
-                Test-Check -VM $vmName -Category "Vault" -Check "Keys file permissions = 600" -Passed ($keysPerms -match "600") -Detail "Actual: $($keysPerms.Trim())"
+                Test-Check -VM $vmName -Category "Vault" -Check "Keys file permissions = 600" -Passed ($keysPerms -match "600") -Detail "Actual: $(if ($keysPerms) { $keysPerms.Trim() } else { 'N/A' })"
 
                 $kvEnabled = Invoke-SSHCheck -IP $ip -Command "VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=`$(jq -r .root_token /root/vault-init.json 2>/dev/null) vault secrets list 2>/dev/null | grep -q secret/ && echo YES || echo NO"
                 Test-Check -VM $vmName -Category "Vault" -Check "KV v2 secrets engine enabled" -Passed ($kvEnabled -match "YES")

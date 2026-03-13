@@ -121,8 +121,17 @@ cat > /etc/ansible/playbooks/ping-all.yml << 'PING'
       ansible.windows.win_ping:
 PING
 
-# Generate SSH key for Ansible
-ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" -q
+# Generate SSH key for Ansible (skip if already exists)
+if [ ! -f /root/.ssh/id_ed25519 ]; then
+    ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" -q
+else
+    echo "SSH key already exists, skipping generation."
+fi
 
 echo "=== Ansible setup complete ==="
 echo "Run: ansible -i /etc/ansible/inventory/boringlab.ini all -m ping"
+
+# Open firewall ports (at end so core setup isn't blocked)
+systemctl enable --now firewalld 2>/dev/null || true
+firewall-cmd --permanent --add-service=ssh 2>/dev/null || true
+firewall-cmd --reload 2>/dev/null || true

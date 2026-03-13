@@ -19,13 +19,6 @@ dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce
 dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 systemctl enable --now docker
 
-# Open firewall ports
-firewall-cmd --permanent --add-port=3000/tcp   # Grafana
-firewall-cmd --permanent --add-port=9090/tcp   # Prometheus
-firewall-cmd --permanent --add-port=9093/tcp   # Alertmanager
-firewall-cmd --permanent --add-port=9100/tcp   # Node Exporter
-firewall-cmd --reload
-
 # Create monitoring directory
 mkdir -p /opt/monitoring/{prometheus,grafana/{provisioning/datasources,provisioning/dashboards,dashboards},alertmanager}
 
@@ -206,3 +199,11 @@ echo "Alertmanager: http://10.10.10.52:9093"
 echo ""
 echo "NOTE: Install node-exporter on other Linux hosts for metrics collection:"
 echo "  dnf install -y node_exporter && systemctl enable --now node_exporter"
+
+# Open firewall ports (at end so core setup isn't blocked)
+systemctl enable --now firewalld 2>/dev/null || true
+firewall-cmd --permanent --add-port=3000/tcp   2>/dev/null || true  # Grafana
+firewall-cmd --permanent --add-port=9090/tcp   2>/dev/null || true  # Prometheus
+firewall-cmd --permanent --add-port=9093/tcp   2>/dev/null || true  # Alertmanager
+firewall-cmd --permanent --add-port=9100/tcp   2>/dev/null || true  # Node Exporter
+firewall-cmd --reload 2>/dev/null || true

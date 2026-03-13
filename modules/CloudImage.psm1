@@ -142,6 +142,7 @@ function Copy-TemplateVHDX {
     <#
     .SYNOPSIS
         Clones a template VHDX for a specific VM and resizes it.
+        Verifies file integrity after copy (parallel copies can corrupt).
     #>
     param(
         [Parameter(Mandatory)][string]$TemplatePath,
@@ -154,8 +155,41 @@ function Copy-TemplateVHDX {
         return
     }
 
-    Write-Host "[IMG ] Cloning template VHDX..." -ForegroundColor Cyan
-    Copy-Item $TemplatePath $DestinationPath -Force
+    $vmName = [System.IO.Path]::GetFileNameWithoutExtension($DestinationPath)
+    $templateSize = (Get-Item $TemplatePath).Length
+    $maxRetries = 3
+
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        Write-Host "[IMG ] Cloning template VHDX for $vmName..." -ForegroundColor Cyan
+        Copy-Item $TemplatePath $DestinationPath -Force
+
+        # Verify: file size must match template exactly
+        $copySize = (Get-Item $DestinationPath).Length
+        if ($copySize -eq $templateSize) {
+            # Verify: Hyper-V can read the VHDX header
+            try {
+                $vhdInfo = Get-VHD $DestinationPath -ErrorAction Stop
+                if ($vhdInfo.Size -gt 0) {
+                    break  # Copy is good
+                }
+            }
+            catch {
+                Write-Warning "VHDX header invalid for $vmName (attempt $attempt/$maxRetries): $_"
+            }
+        }
+        else {
+            Write-Warning "VHDX size mismatch for $vmName (attempt $attempt/$maxRetries): expected $templateSize bytes, got $copySize bytes"
+        }
+
+        # Bad copy — remove and retry
+        Remove-Item $DestinationPath -Force -ErrorAction SilentlyContinue
+        if ($attempt -lt $maxRetries) {
+            Start-Sleep -Seconds 2
+        }
+        else {
+            throw "Failed to clone template VHDX for $vmName after $maxRetries attempts. Template may be locked or disk I/O issue."
+        }
+    }
 
     # Resize to target size
     $currentSize = (Get-VHD $DestinationPath).Size
@@ -164,7 +198,7 @@ function Copy-TemplateVHDX {
         Resize-VHD -Path $DestinationPath -SizeBytes $SizeBytes
     }
 
-    Write-Host "[OK  ] VHDX ready: $DestinationPath" -ForegroundColor Green
+    Write-Host "[OK  ] VHDX ready: $DestinationPath ($([math]::Round($copySize / 1MB))MB copied, verified)" -ForegroundColor Green
 }
 
 function Find-QemuImg {
