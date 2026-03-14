@@ -427,7 +427,7 @@ if (-not $SkipLinux) {
                 $nodes = Invoke-SSHCheck -IP $ip -Command "kubectl get nodes --no-headers 2>/dev/null | head -5"
                 Test-Check -VM $vmName -Category "K8s" -Check "kubectl get nodes works" -Passed ($null -ne $nodes -and $nodes.Length -gt 0) -Detail ($nodes -join " | ")
 
-                $masterReady = Invoke-SSHCheck -IP $ip -Command "kubectl get nodes --no-headers 2>/dev/null | grep K8S-MASTER | grep -q Ready && echo YES || echo NO"
+                $masterReady = Invoke-SSHCheck -IP $ip -Command "kubectl get nodes --no-headers 2>/dev/null | grep -i k8s-master | grep -q Ready && echo YES || echo NO"
                 Test-Check -VM $vmName -Category "K8s" -Check "Master node is Ready" -Passed ($masterReady -match "YES")
 
                 $calico = Invoke-SSHCheck -IP $ip -Command "kubectl get pods -n kube-system --no-headers 2>/dev/null | grep calico-node | grep -q Running && echo YES || echo NO"

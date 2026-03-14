@@ -84,8 +84,7 @@ function New-LabVM {
     }
 
     # Disable automatic checkpoints
-    Set-VM -VMName $vmName -AutomaticCheckpointsEnabled $false
-    Set-VM -VMName $vmName -CheckpointType Standard
+    Set-VM -VMName $vmName -AutomaticCheckpointsEnabled $false -CheckpointType Standard
 
     Write-Host "[OK  ] VM '$vmName' created successfully." -ForegroundColor Green
 }

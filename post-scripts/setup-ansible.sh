@@ -10,12 +10,7 @@ dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noar
 dnf install -y ansible-core python3-pip sshpass
 
 # Install additional Ansible collections
-ansible-galaxy collection install ansible.windows
-ansible-galaxy collection install community.general
-ansible-galaxy collection install community.mysql
-ansible-galaxy collection install community.postgresql
-ansible-galaxy collection install kubernetes.core
-ansible-galaxy collection install ansible.posix
+ansible-galaxy collection install ansible.windows community.general community.mysql community.postgresql kubernetes.core ansible.posix
 
 # Install pywinrm for Windows management
 # PEP 668: RHEL 10 requires --break-system-packages for system-wide pip installs

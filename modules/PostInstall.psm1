@@ -42,10 +42,12 @@ function Invoke-SSHCommand {
 
     $deployed = $false
 
+    # Remove stale host key once before retrying
+    ssh-keygen -R $IP 2>&1 | Out-Null
+
     # --- Phase 1: Deploy script via SCP ---
     for ($i = 1; $i -le $MaxRetries; $i++) {
         Write-Host "[SSH ] Attempting SSH to $IP (try $i/$MaxRetries)..." -ForegroundColor Gray
-        ssh-keygen -R $IP 2>&1 | Out-Null
 
         & scp @sshOpts $localTemp "root@${IP}:$tempScript" 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {
@@ -346,12 +348,6 @@ function Invoke-LinuxPostInstall {
     # For K8s workers, inject the join command
     if ($role -eq "K8sWorker" -and $K8sJoinCommand) {
         $scriptContent = $scriptContent -replace "##K8S_JOIN_COMMAND##", $K8sJoinCommand
-    }
-
-    # Scripts that accept service password as $1
-    $needsPassword = @("setup-database.sh", "setup-monitoring.sh", "setup-docker-harbor.sh", "setup-vault.sh")
-    if ($scriptFile -in $needsPassword) {
-        $scriptContent = $scriptContent + "`n# Service password is passed as argument `$1"
     }
 
     Invoke-SSHCommand -VMName $vmName -IP $ip -SSHKeyPath $SSHKeyPath `
