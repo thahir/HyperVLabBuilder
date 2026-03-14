@@ -27,17 +27,9 @@
 .PARAMETER SkipWindows
     Skip Windows VMs (DC01, WS01, WS02). Useful when only Linux services need fixing.
 
-.PARAMETER Sequential
-    Run VMs one at a time instead of in parallel. Slower but much easier to
-    troubleshoot — clean output, clear per-VM pass/fail, no interleaved logs.
-
 .EXAMPLE
     .\Install-BoringLab.ps1
-    # Full post-install on all VMs (wave-based: DC first, then all others in parallel)
-
-.EXAMPLE
-    .\Install-BoringLab.ps1 -Sequential
-    # Same as above but one VM at a time — ideal for first run / troubleshooting
+    # Full post-install on all VMs (sequential: DC first, then each VM one at a time)
 
 .EXAMPLE
     .\Install-BoringLab.ps1 -VMNames GITLAB01, DOCKER01, VAULT01
@@ -52,8 +44,7 @@ param(
     [string[]]$VMNames,
     [PSCredential]$WinCredential,
     [string]$SSHKeyPath,
-    [switch]$SkipWindows,
-    [switch]$Sequential
+    [switch]$SkipWindows
 )
 
 $ErrorActionPreference = "Continue"
@@ -82,8 +73,7 @@ Write-Host @"
 
 "@ -ForegroundColor Cyan
 
-$modeLabel = if ($Sequential) { "SEQUENTIAL (one at a time)" } else { "PARALLEL" }
-Write-Host "    Mode: $modeLabel" -ForegroundColor $(if ($Sequential) { "Yellow" } else { "Green" })
+Write-Host "    Mode: SEQUENTIAL (one VM at a time)" -ForegroundColor Green
 Write-Host ""
 
 # ============================================================
@@ -205,143 +195,9 @@ Write-Log "$running/$($targetNames.Count) target VMs are running." "Green"
 # ============================================================
 Write-Host ""
 
-# Build domain credential once (used by both modes)
-$domainCred = $null
-if ($WinCredential) {
-    $domainUser = "$($Config.DomainNetBIOS)\$($Config.DomainAdminUser)"
-    $domainCred = New-Object PSCredential($domainUser, $WinCredential.Password)
-}
-
-# Track results for summary
-$script:results = @()
-
-function Invoke-LinuxVMInstall {
-    <# Runs post-install on a single Linux VM. Used by sequential mode. #>
-    param([hashtable]$VMDef)
-
-    $vmStart = Get-Date
-    $vmName = $VMDef.Name
-    Write-Host ""
-    Write-Host ("=" * 60) -ForegroundColor Cyan
-    Write-Log "[$vmName] Starting post-install ($($VMDef.Role))..." "Cyan"
-    Write-Host ("=" * 60) -ForegroundColor Cyan
-
-    try {
-        if ($VMDef.Role -eq "K8sWorker") {
-            $masterIP = ($Config.VMs | Where-Object { $_.Role -eq "K8sMaster" }).IP
-            $sshOpts = @("-i", $SSHKeyPath, "-o", "StrictHostKeyChecking=no",
-                         "-o", "UserKnownHostsFile=/dev/null",
-                         "-o", "ConnectTimeout=10", "-o", "BatchMode=yes")
-            $joinCmd = & ssh @sshOpts "root@$masterIP" `
-                "cat /root/k8s-join-command.txt 2>/dev/null || kubeadm token create --print-join-command 2>/dev/null" 2>$null
-
-            if (-not ($joinCmd -match "kubeadm join")) {
-                Write-Warning "[$vmName] Could not get join command. Worker will try to fetch it directly."
-                $joinCmd = $null
-            }
-
-            Invoke-LinuxPostInstall -VMDef $VMDef -Config $Config `
-                -SSHKeyPath $SSHKeyPath -K8sJoinCommand $joinCmd
-        }
-        else {
-            Invoke-LinuxPostInstall -VMDef $VMDef -Config $Config -SSHKeyPath $SSHKeyPath
-        }
-
-        $elapsed = [math]::Round(((Get-Date) - $vmStart).TotalMinutes, 1)
-        Write-Host "[PASS] $vmName completed in ${elapsed}m" -ForegroundColor Green
-        $script:results += @{ Name = $vmName; Status = "PASS"; Time = "${elapsed}m" }
-    }
-    catch {
-        $elapsed = [math]::Round(((Get-Date) - $vmStart).TotalMinutes, 1)
-        Write-Host "[FAIL] $vmName failed after ${elapsed}m: $_" -ForegroundColor Red
-        $script:results += @{ Name = $vmName; Status = "FAIL"; Time = "${elapsed}m"; Error = "$_" }
-    }
-}
-
-if ($Sequential) {
-    # ── Sequential mode: one VM at a time, clear output ──
-    Write-Log "=== Sequential Post-Install ===" "Magenta"
-
-    # Windows VMs first (DC before member servers)
-    $windowsTargets = @($targetVMs | Where-Object { $_.OS -eq "Windows" })
-    if ($windowsTargets.Count -gt 0) {
-        $dc = $windowsTargets | Where-Object { $_.Role -eq "DomainController" }
-        if ($dc) {
-            $vmStart = Get-Date
-            Write-Host ""
-            Write-Host ("=" * 60) -ForegroundColor Cyan
-            Write-Log "[$($dc.Name)] Starting post-install (DomainController)..." "Cyan"
-            Write-Host ("=" * 60) -ForegroundColor Cyan
-            try {
-                Invoke-WindowsPostInstall -VMDef $dc -Config $Config `
-                    -LocalCredential $WinCredential -DomainCredential $domainCred
-                $elapsed = [math]::Round(((Get-Date) - $vmStart).TotalMinutes, 1)
-                Write-Host "[PASS] $($dc.Name) completed in ${elapsed}m" -ForegroundColor Green
-                $script:results += @{ Name = $dc.Name; Status = "PASS"; Time = "${elapsed}m" }
-            }
-            catch {
-                $elapsed = [math]::Round(((Get-Date) - $vmStart).TotalMinutes, 1)
-                Write-Host "[FAIL] $($dc.Name) failed after ${elapsed}m: $_" -ForegroundColor Red
-                $script:results += @{ Name = $dc.Name; Status = "FAIL"; Time = "${elapsed}m"; Error = "$_" }
-            }
-        }
-
-        foreach ($vm in ($windowsTargets | Where-Object { $_.Role -ne "DomainController" })) {
-            $vmStart = Get-Date
-            Write-Host ""
-            Write-Host ("=" * 60) -ForegroundColor Cyan
-            Write-Log "[$($vm.Name)] Starting post-install ($($vm.Role))..." "Cyan"
-            Write-Host ("=" * 60) -ForegroundColor Cyan
-            try {
-                Invoke-WindowsPostInstall -VMDef $vm -Config $Config `
-                    -LocalCredential $WinCredential -DomainCredential $domainCred
-                $elapsed = [math]::Round(((Get-Date) - $vmStart).TotalMinutes, 1)
-                Write-Host "[PASS] $($vm.Name) completed in ${elapsed}m" -ForegroundColor Green
-                $script:results += @{ Name = $vm.Name; Status = "PASS"; Time = "${elapsed}m" }
-            }
-            catch {
-                $elapsed = [math]::Round(((Get-Date) - $vmStart).TotalMinutes, 1)
-                Write-Host "[FAIL] $($vm.Name) failed after ${elapsed}m: $_" -ForegroundColor Red
-                $script:results += @{ Name = $vm.Name; Status = "FAIL"; Time = "${elapsed}m"; Error = "$_" }
-            }
-        }
-    }
-
-    # Linux VMs: one at a time, K8s master before workers
-    $linuxTargets = @($targetVMs | Where-Object { $_.OS -eq "RHEL" })
-    if ($linuxTargets.Count -gt 0) {
-        # Order: K8s master first, then workers, then everything else
-        $k8sMaster  = @($linuxTargets | Where-Object { $_.Role -eq "K8sMaster" })
-        $k8sWorkers = @($linuxTargets | Where-Object { $_.Role -eq "K8sWorker" })
-        $others     = @($linuxTargets | Where-Object { $_.Role -notin @("K8sMaster", "K8sWorker") })
-
-        $orderedLinux = $k8sMaster + $others + $k8sWorkers
-
-        foreach ($vmDef in $orderedLinux) {
-            Invoke-LinuxVMInstall -VMDef $vmDef
-        }
-    }
-
-    # Print results table
-    Write-Host ""
-    Write-Host ("=" * 60) -ForegroundColor Magenta
-    Write-Log "=== Results ===" "Magenta"
-    Write-Host ("=" * 60) -ForegroundColor Magenta
-    foreach ($r in $script:results) {
-        $statusColor = if ($r.Status -eq "PASS") { "Green" } else { "Red" }
-        $pad = ($r.Name).PadRight(14)
-        $line = "  $pad $($r.Status)  ($($r.Time))"
-        if ($r.Error) { $line += "  — $($r.Error)" }
-        Write-Host $line -ForegroundColor $statusColor
-    }
-    $passed = ($script:results | Where-Object { $_.Status -eq "PASS" }).Count
-    $failed = ($script:results | Where-Object { $_.Status -eq "FAIL" }).Count
-    Write-Host ""
-    Write-Host "  Passed: $passed  |  Failed: $failed  |  Total: $($script:results.Count)" -ForegroundColor $(if ($failed -gt 0) { "Yellow" } else { "Green" })
-}
-elseif (-not $VMNames) {
-    # ── Full mode (parallel): use wave-based orchestration from PostInstall.psm1 ──
-    Write-Log "=== Full Post-Install (Wave-Based Parallel) ===" "Magenta"
+if (-not $VMNames) {
+    # ── Full mode: all VMs via Invoke-AllPostInstall (sequential with per-VM results) ──
+    Write-Log "=== Full Post-Install ===" "Magenta"
 
     # Build filtered config if SkipWindows
     $installConfig = $Config.Clone()
@@ -352,72 +208,14 @@ elseif (-not $VMNames) {
     Invoke-AllPostInstall -Config $installConfig -WinCredential $WinCredential -SSHKeyPath $SSHKeyPath
 }
 else {
-    # ── Targeted mode (parallel): run specific VMs ──
+    # ── Targeted mode: specific VMs by name (sequential) ──
     Write-Log "=== Targeted Post-Install ===" "Magenta"
 
-    # Windows VMs: sequential (DC must complete before member servers)
-    $windowsTargets = @($targetVMs | Where-Object { $_.OS -eq "Windows" })
-    if ($windowsTargets.Count -gt 0) {
-        Write-Log "Installing $($windowsTargets.Count) Windows VM(s)..." "Cyan"
+    # Build targeted config and run through the same sequential pipeline
+    $installConfig = $Config.Clone()
+    $installConfig.VMs = @($targetVMs)
 
-        # DC first
-        $dc = $windowsTargets | Where-Object { $_.Role -eq "DomainController" }
-        if ($dc) {
-            Invoke-WindowsPostInstall -VMDef $dc -Config $Config `
-                -LocalCredential $WinCredential -DomainCredential $domainCred
-        }
-
-        # Then member servers
-        foreach ($vm in ($windowsTargets | Where-Object { $_.Role -ne "DomainController" })) {
-            Invoke-WindowsPostInstall -VMDef $vm -Config $Config `
-                -LocalCredential $WinCredential -DomainCredential $domainCred
-        }
-    }
-
-    # Linux VMs: parallel
-    $linuxTargets = @($targetVMs | Where-Object { $_.OS -eq "RHEL" })
-    if ($linuxTargets.Count -gt 0) {
-        Write-Log "Installing $($linuxTargets.Count) Linux VM(s) in parallel..." "Cyan"
-        foreach ($v in $linuxTargets) {
-            Write-Host "  - $($v.Name) ($($v.Role))" -ForegroundColor Gray
-        }
-
-        $linuxTargets | ForEach-Object -ThrottleLimit 11 -Parallel {
-            $vmDef   = $_
-            $config  = $using:Config
-            $keyPath = $using:SSHKeyPath
-            $modDir  = $using:modulePath
-
-            Import-Module (Join-Path $modDir "PostInstall.psm1") -Force
-            Import-Module (Join-Path $modDir "LabVM.psm1") -Force
-
-            try {
-                if ($vmDef.Role -eq "K8sWorker") {
-                    $masterIP = ($config.VMs | Where-Object { $_.Role -eq "K8sMaster" }).IP
-                    $sshOpts = @("-i", $keyPath, "-o", "StrictHostKeyChecking=no",
-                                 "-o", "UserKnownHostsFile=/dev/null",
-                                 "-o", "ConnectTimeout=10", "-o", "BatchMode=yes")
-                    $joinCmd = & ssh @sshOpts "root@$masterIP" `
-                        "cat /root/k8s-join-command.txt 2>/dev/null || kubeadm token create --print-join-command 2>/dev/null" 2>$null
-
-                    if (-not ($joinCmd -match "kubeadm join")) {
-                        Write-Warning "$($vmDef.Name): Could not get join command. Worker will try to fetch it directly."
-                        $joinCmd = $null
-                    }
-
-                    Invoke-LinuxPostInstall -VMDef $vmDef -Config $config `
-                        -SSHKeyPath $keyPath -K8sJoinCommand $joinCmd
-                }
-                else {
-                    Invoke-LinuxPostInstall -VMDef $vmDef -Config $config -SSHKeyPath $keyPath
-                }
-                Write-Host "[OK  ] Post-install completed for $($vmDef.Name)." -ForegroundColor Green
-            }
-            catch {
-                Write-Warning "Post-install failed for $($vmDef.Name): $_"
-            }
-        }
-    }
+    Invoke-AllPostInstall -Config $installConfig -WinCredential $WinCredential -SSHKeyPath $SSHKeyPath
 }
 
 # ============================================================

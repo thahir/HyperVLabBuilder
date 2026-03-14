@@ -4,6 +4,11 @@ exec > /root/k8s-worker-setup.log 2>&1
 
 echo "=== BoringLab: Kubernetes Worker Setup ==="
 
+# Kubernetes requires lowercase hostnames. Lowercase whatever cloud-init set.
+LOWER_HOSTNAME=$(hostname | tr '[:upper:]' '[:lower:]')
+hostnamectl set-hostname "$LOWER_HOSTNAME"
+hostname "$LOWER_HOSTNAME"
+
 # Idempotency: skip if already joined
 if [ -f /etc/kubernetes/kubelet.conf ]; then
     echo "Already joined to a Kubernetes cluster. Skipping."
@@ -19,8 +24,16 @@ cat > /etc/modules-load.d/k8s.conf << 'EOF'
 overlay
 br_netfilter
 EOF
-modprobe overlay
-modprobe br_netfilter
+# On RHEL 10+ (kernel 6.x), br_netfilter is built into the kernel.
+# Load 'bridge' first — it makes br_netfilter's sysctl entries visible.
+modprobe bridge 2>/dev/null || true
+modprobe overlay 2>/dev/null || true
+modprobe br_netfilter 2>/dev/null || true
+
+# If the /proc entry still isn't visible, continue anyway (built-in assumed).
+if [ ! -f /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    echo "WARNING: bridge-nf-call-iptables not visible in /proc yet. Continuing anyway (built-in kernel support assumed)."
+fi
 
 # Sysctl params
 cat > /etc/sysctl.d/k8s.conf << 'EOF'

@@ -17,8 +17,7 @@
 #>
 
 param(
-    [switch]$SkipPostInstall,
-    [switch]$Sequential
+    [switch]$SkipPostInstall
 )
 
 $ErrorActionPreference = "Continue"
@@ -435,7 +434,6 @@ if (-not $SkipPostInstall) {
         WinCredential = $winCredential
         SSHKeyPath    = $sshKeyPath
     }
-    if ($Sequential) { $installParams.Sequential = $true }
     & $installScript @installParams
 }
 else {

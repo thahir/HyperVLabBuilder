@@ -17,7 +17,7 @@ function Invoke-SSHCommand {
         [string]$ServicePassword = "",
         [int]$MaxRetries = 20,
         [int]$RetryDelaySeconds = 30,
-        [int]$ExecutionTimeoutMinutes = 120,
+        [int]$ExecutionTimeoutMinutes = 30,
         [int]$PollIntervalSeconds = 30
     )
 
@@ -93,15 +93,15 @@ function Invoke-SSHCommand {
     # The wrapper: run the actual script with timeout, write exit code to file, record PID.
     # nohup ensures the script survives SSH disconnect / Ctrl+C.
     $timeoutSec = $ExecutionTimeoutMinutes * 60
-    $launchCmd = @(
-        "rm -f $exitFile $pidFile"
-        "chmod +x $tempScript"
-        "nohup bash -c 'timeout --signal=TERM --kill-after=30 $timeoutSec bash $tempScript$svcPassArg; echo BORINGLAB_EXIT=\`\$? > $exitFile' > /tmp/boringlab-$ScriptName-nohup.log 2>&1 &"
-        "echo `$! > $pidFile"
-    ) -join " && "
+    # Note: nohup backgrounds with &, so we use ; (not &&) to chain echo $!
+    # because & terminates the command and && after & is a bash syntax error.
+    $launchCmd = "rm -f $exitFile $pidFile && chmod +x $tempScript && nohup bash -c 'timeout --signal=TERM --kill-after=30 $timeoutSec bash $tempScript$svcPassArg; echo BORINGLAB_EXIT=`$`? > $exitFile' > /tmp/boringlab-$ScriptName-nohup.log 2>&1 & echo `$! > $pidFile"
 
     Write-Host "[SSH ] Script deployed to '$VMName'. Launching detached (timeout: ${ExecutionTimeoutMinutes}m)..." -ForegroundColor Cyan
-    & ssh @sshOpts "root@$IP" $launchCmd 2>&1 | Out-Null
+    $launchOutput = & ssh @sshOpts "root@$IP" $launchCmd 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "SSH launch command failed for '$VMName' (exit code: $LASTEXITCODE). Output: $launchOutput"
+    }
 
     # --- Phase 3: Poll for completion ---
     $deadline = (Get-Date).AddMinutes($ExecutionTimeoutMinutes + 5)  # Extra 5 min grace
@@ -362,12 +362,16 @@ function Invoke-LinuxPostInstall {
 function Invoke-AllPostInstall {
     <#
     .SYNOPSIS
-        Orchestrates post-install using wave-based parallel execution.
-        Dependency chain:
-          Wave 1: DC01 (must complete first — domain + DNS + DHCP)
-          Wave 2: ALL remaining VMs in parallel. K8s workers poll for
-                  the master join command themselves, so they start as
-                  soon as K8S-MASTER finishes (no separate wave).
+        Orchestrates post-install sequentially with detailed per-VM logging.
+        VM deployment is parallel (Phase 3-5), but post-install runs one VM
+        at a time for clean output, clear pass/fail, and easy troubleshooting.
+
+        Execution order (dependency-aware):
+          1. DC01             — AD + DNS + DHCP (everything depends on this)
+          2. WS01, WS02       — Domain join + features
+          3. K8S-MASTER       — Cluster init + Calico + join command
+          4. ANSIBLE01, GITLAB01, DOCKER01, MONITOR01, DB01, VAULT01, RHEL01, RHEL02
+          5. K8S-WORKER1, K8S-WORKER2  — Join cluster (needs master done)
     #>
     param(
         [Parameter(Mandatory)]
@@ -381,96 +385,113 @@ function Invoke-AllPostInstall {
     )
 
     $vms = $Config.VMs
-    $modulesPath = $PSScriptRoot
+    $results = @()
 
     # Build domain credential
     $domainUser = "$($Config.DomainNetBIOS)\$($Config.DomainAdminUser)"
     $domainCred = New-Object PSCredential($domainUser, $WinCredential.Password)
 
-    # ============================================================
-    # Wave 1: Domain Controller (sequential - everything depends on it)
-    # ============================================================
+    # ── Build execution order ──
+    # 1. DC first, 2. Windows member servers, 3. K8s master, 4. Other Linux, 5. K8s workers
+    $dc          = @($vms | Where-Object { $_.Role -eq "DomainController" })
+    $winMembers  = @($vms | Where-Object { $_.OS -eq "Windows" -and $_.Role -ne "DomainController" })
+    $k8sMaster   = @($vms | Where-Object { $_.Role -eq "K8sMaster" })
+    $k8sWorkers  = @($vms | Where-Object { $_.Role -eq "K8sWorker" })
+    $otherLinux  = @($vms | Where-Object { $_.OS -eq "RHEL" -and $_.Role -notin @("K8sMaster", "K8sWorker") })
+    $orderedVMs  = $dc + $winMembers + $k8sMaster + $otherLinux + $k8sWorkers
+
+    $totalVMs = $orderedVMs.Count
     Write-Host ""
-    Write-Host "=== Wave 1/2: Domain Controller ===" -ForegroundColor Magenta
-    $dc = $vms | Where-Object { $_.Role -eq "DomainController" }
-    if ($dc) {
-        Invoke-WindowsPostInstall -VMDef $dc -Config $Config -LocalCredential $WinCredential -DomainCredential $domainCred
+    Write-Host "=== Sequential Post-Install ($totalVMs VMs) ===" -ForegroundColor Magenta
+    Write-Host ""
+    Write-Host "  Execution order:" -ForegroundColor Cyan
+    $seq = 1
+    foreach ($v in $orderedVMs) {
+        $pad = ($v.Name).PadRight(14)
+        Write-Host "    $seq. $pad $($v.IP)  ($($v.Role))" -ForegroundColor White
+        $seq++
     }
-
-    # ============================================================
-    # Wave 2: ALL remaining VMs in parallel (including K8s workers)
-    # ============================================================
     Write-Host ""
-    Write-Host "=== Wave 2/2: All Remaining VMs (parallel) ===" -ForegroundColor Magenta
 
-    # Wave 2: ALL remaining VMs in a single parallel batch (including K8s workers).
-    # K8s workers poll for the join command from master — they start as soon as
-    # the master finishes instead of waiting for the entire wave to complete.
-    # Using ForEach-Object -Parallel (Start-ThreadJob can't auto-load Hyper-V CDXML module)
-    $wave2VMs = @($vms | Where-Object { $_.Role -ne "DomainController" })
+    # ── Run each VM sequentially ──
+    $vmIndex = 0
+    foreach ($vmDef in $orderedVMs) {
+        $vmIndex++
+        $vmName = $vmDef.Name
+        $vmStart = Get-Date
+        $ts = $vmStart.ToString("HH:mm:ss")
 
-    if ($wave2VMs.Count -gt 0) {
-        Write-Host "[PARA] Running $($wave2VMs.Count) post-install jobs in parallel:" -ForegroundColor Cyan
-        foreach ($v in $wave2VMs) {
-            Write-Host "       - Post-$($v.Name)" -ForegroundColor Gray
-        }
+        Write-Host ""
+        Write-Host ("=" * 70) -ForegroundColor Cyan
+        Write-Host "[$ts] [$vmIndex/$totalVMs] $vmName — $($vmDef.Role) ($($vmDef.OS)) @ $($vmDef.IP)" -ForegroundColor Cyan
+        Write-Host ("=" * 70) -ForegroundColor Cyan
 
-        $wave2VMs | ForEach-Object -ThrottleLimit 11 -Parallel {
-            $vmDef     = $_
-            $config    = $using:Config
-            $localCred = $using:WinCredential
-            $domCred   = $using:domainCred
-            $keyPath   = $using:SSHKeyPath
-            $modDir    = $using:modulesPath
+        try {
+            if ($vmDef.OS -eq "Windows") {
+                Invoke-WindowsPostInstall -VMDef $vmDef -Config $Config `
+                    -LocalCredential $WinCredential -DomainCredential $domainCred
+            }
+            elseif ($vmDef.Role -eq "K8sWorker") {
+                # Fetch join command from master (master already completed at this point)
+                $masterIP = ($vms | Where-Object { $_.Role -eq "K8sMaster" }).IP
+                $sshOpts = @("-i", $SSHKeyPath, "-o", "StrictHostKeyChecking=no",
+                             "-o", "UserKnownHostsFile=/dev/null",
+                             "-o", "ConnectTimeout=10", "-o", "BatchMode=yes")
 
-            Import-Module (Join-Path $modDir "PostInstall.psm1") -Force
-            Import-Module (Join-Path $modDir "LabVM.psm1") -Force
+                Write-Host "[K8S ] Fetching join command from master ($masterIP)..." -ForegroundColor Cyan
+                $joinCmd = & ssh @sshOpts "root@$masterIP" `
+                    "cat /root/k8s-join-command.txt 2>/dev/null || kubeadm token create --print-join-command 2>/dev/null" 2>$null
 
-            try {
-                if ($vmDef.Role -eq "K8sWorker") {
-                    # Workers poll for the join command from K8S-MASTER (runs in parallel)
-                    $masterIP = ($config.VMs | Where-Object { $_.Role -eq "K8sMaster" }).IP
-                    $sshOpts = @("-i", $keyPath, "-o", "StrictHostKeyChecking=no",
-                                 "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes")
-                    $joinCmd = $null
-
-                    Write-Host "[K8S ] $($vmDef.Name): Waiting for master join command..." -ForegroundColor Cyan
-                    for ($try = 1; $try -le 40; $try++) {
-                        Start-Sleep -Seconds 30
-                        $result = & ssh @sshOpts "root@$masterIP" "cat /root/k8s-join-command.txt 2>/dev/null" 2>$null
-                        if ($result -match "kubeadm join") {
-                            $joinCmd = $result
-                            Write-Host "[K8S ] $($vmDef.Name): Join command retrieved from master." -ForegroundColor Green
-                            break
-                        }
-                    }
-                    if (-not $joinCmd) {
-                        Write-Warning "$($vmDef.Name): Could not get join command after 20 min. Trying kubeadm token create..."
-                        $joinCmd = & ssh @sshOpts "root@$masterIP" "kubeadm token create --print-join-command 2>/dev/null" 2>$null
-                    }
-
-                    Invoke-LinuxPostInstall -VMDef $vmDef -Config $config -SSHKeyPath $keyPath -K8sJoinCommand $joinCmd
-                }
-                elseif ($vmDef.OS -eq "Windows") {
-                    Invoke-WindowsPostInstall -VMDef $vmDef -Config $config -LocalCredential $localCred -DomainCredential $domCred
+                if ($joinCmd -match "kubeadm join") {
+                    Write-Host "[K8S ] Join command retrieved." -ForegroundColor Green
                 }
                 else {
-                    Invoke-LinuxPostInstall -VMDef $vmDef -Config $config -SSHKeyPath $keyPath
+                    Write-Warning "[$vmName] Could not get join command from master."
+                    $joinCmd = $null
                 }
-                Write-Host "[OK  ] Post-$($vmDef.Name) completed." -ForegroundColor Green
+
+                Invoke-LinuxPostInstall -VMDef $vmDef -Config $Config `
+                    -SSHKeyPath $SSHKeyPath -K8sJoinCommand $joinCmd
             }
-            catch {
-                Write-Warning "Post-install for $($vmDef.Name) failed: $_"
+            else {
+                Invoke-LinuxPostInstall -VMDef $vmDef -Config $Config -SSHKeyPath $SSHKeyPath
             }
+
+            $elapsed = [math]::Round(((Get-Date) - $vmStart).TotalMinutes, 1)
+            $ts = (Get-Date).ToString("HH:mm:ss")
+            Write-Host "[$ts] [PASS] $vmName completed in ${elapsed}m" -ForegroundColor Green
+            $results += @{ Name = $vmName; Status = "PASS"; Time = "${elapsed}m" }
+        }
+        catch {
+            $elapsed = [math]::Round(((Get-Date) - $vmStart).TotalMinutes, 1)
+            $ts = (Get-Date).ToString("HH:mm:ss")
+            Write-Host "[$ts] [FAIL] $vmName failed after ${elapsed}m: $_" -ForegroundColor Red
+            $results += @{ Name = $vmName; Status = "FAIL"; Time = "${elapsed}m"; Error = "$_" }
         }
     }
+
+    # ============================================================
+    # Results Table
+    # ============================================================
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Magenta
+    Write-Host " Post-Install Results" -ForegroundColor Magenta
+    Write-Host ("=" * 70) -ForegroundColor Magenta
+    foreach ($r in $results) {
+        $statusColor = if ($r.Status -eq "PASS") { "Green" } else { "Red" }
+        $pad = ($r.Name).PadRight(14)
+        $line = "  $pad $($r.Status)  ($($r.Time))"
+        if ($r.Error) { $line += "  — $($r.Error)" }
+        Write-Host $line -ForegroundColor $statusColor
+    }
+    $passed = ($results | Where-Object { $_.Status -eq "PASS" }).Count
+    $failed = ($results | Where-Object { $_.Status -eq "FAIL" }).Count
+    Write-Host ""
+    Write-Host "  Passed: $passed  |  Failed: $failed  |  Total: $($results.Count)" -ForegroundColor $(if ($failed -gt 0) { "Yellow" } else { "Green" })
 
     # ============================================================
     # Summary
     # ============================================================
-    Write-Host ""
-    Write-Host "[OK  ] RHEL01 and RHEL02 are ready as general-purpose servers." -ForegroundColor Green
-
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Green
     Write-Host " BoringLab Post-Install Complete!" -ForegroundColor Green

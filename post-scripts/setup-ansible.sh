@@ -6,7 +6,8 @@ echo "=== BoringLab: Ansible Control Node Setup ==="
 
 # Install EPEL and Ansible (RHEL 10)
 dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm || true
-dnf install -y ansible-core python3-pip python3-winrm sshpass
+# python3-winrm doesn't exist in RHEL 10 repos (installed via pip below)
+dnf install -y ansible-core python3-pip sshpass
 
 # Install additional Ansible collections
 ansible-galaxy collection install ansible.windows
@@ -17,10 +18,11 @@ ansible-galaxy collection install kubernetes.core
 ansible-galaxy collection install ansible.posix
 
 # Install pywinrm for Windows management
-pip3 install pywinrm requests-ntlm
+# PEP 668: RHEL 10 requires --break-system-packages for system-wide pip installs
+pip3 install --break-system-packages pywinrm requests-ntlm
 
 # Create Ansible directory structure
-mkdir -p /etc/ansible/{inventory,group_vars,host_vars,roles,playbooks}
+mkdir -p /etc/ansible/{inventory/group_vars,inventory/host_vars,roles,playbooks}
 
 # Create inventory file
 cat > /etc/ansible/inventory/boringlab.ini << 'INV'
